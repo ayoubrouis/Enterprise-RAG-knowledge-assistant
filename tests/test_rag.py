@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -688,3 +690,127 @@ def test_query_returns_429_when_rate_limit_exceeded(client, monkeypatch):
     assert blocked.status_code == 429
     retry = int(blocked.headers["Retry-After"])
     assert 1 <= retry <= 61  # within one window of the oldest hit
+
+
+# ---------------------------------------------------------------------------
+# manage.py backup / restore
+# ---------------------------------------------------------------------------
+
+
+def _make_site_data(root: Path) -> tuple[Path, Path]:
+    """Create a DB with a sentinel row plus one tenant with a doc."""
+    import sqlite3
+
+    data = root / "data"
+    db_path = data / "system.db"
+    db_path.parent.mkdir(parents=True)
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("CREATE TABLE t (x TEXT)")
+    conn.execute("INSERT INTO t VALUES ('sentinel')")
+    conn.commit()
+    conn.close()
+    docs = data / "tenants" / "acme" / "docs"
+    docs.mkdir(parents=True)
+    (docs / "a.txt").write_text("hello", encoding="utf-8")
+    return db_path, data / "tenants"
+
+
+def test_manage_backup_snapshots_db_and_tenants(monkeypatch, tmp_path):
+    from scripts.manage import cmd_backup
+
+    db_path, tenants_dir = _make_site_data(tmp_path / "src")
+    monkeypatch.setattr(settings, "DB_PATH", db_path)
+    monkeypatch.setattr(settings, "TENANTS_DIR", tenants_dir)
+    monkeypatch.setattr(settings, "DATA_DIR", db_path.parent)
+
+    class Args:
+        out = str(tmp_path / "backups")
+
+    cmd_backup(Args())
+    backups = list((tmp_path / "backups").iterdir())
+    assert len(backups) == 1
+    b = backups[0]
+    assert (b / "system.db").exists()
+    assert (b / "tenants" / "acme" / "docs" / "a.txt").read_text(encoding="utf-8") == "hello"
+    manifest = json.loads((b / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["tenants"] == ["acme"]
+
+
+def test_manage_restore_into_empty_dir(monkeypatch, tmp_path):
+    import sqlite3
+
+    from scripts.manage import cmd_backup, cmd_restore
+
+    db_path, tenants_dir = _make_site_data(tmp_path / "src")
+    monkeypatch.setattr(settings, "DB_PATH", db_path)
+    monkeypatch.setattr(settings, "TENANTS_DIR", tenants_dir)
+    monkeypatch.setattr(settings, "DATA_DIR", db_path.parent)
+
+    class BackupArgs:
+        out = str(tmp_path / "backups")
+
+    cmd_backup(BackupArgs())
+    b = next((tmp_path / "backups").iterdir())
+
+    dst = tmp_path / "dst"
+    monkeypatch.setattr(settings, "DB_PATH", dst / "system.db")
+    monkeypatch.setattr(settings, "TENANTS_DIR", dst / "tenants")
+    monkeypatch.setattr(settings, "DATA_DIR", dst)
+
+    class RestoreArgs:
+        from_path = str(b)
+        force = False
+
+    cmd_restore(RestoreArgs())
+    conn = sqlite3.connect(str(dst / "system.db"))
+    assert conn.execute("SELECT x FROM t").fetchone()[0] == "sentinel"
+    conn.close()
+    assert (dst / "tenants" / "acme" / "docs" / "a.txt").read_text(encoding="utf-8") == "hello"
+
+
+def test_manage_restore_refuses_to_overwrite_without_force(monkeypatch, tmp_path):
+    from scripts.manage import cmd_restore
+
+    db_path, tenants_dir = _make_site_data(tmp_path / "src")
+    monkeypatch.setattr(settings, "DB_PATH", db_path)
+    monkeypatch.setattr(settings, "TENANTS_DIR", tenants_dir)
+    monkeypatch.setattr(settings, "DATA_DIR", db_path.parent)
+
+    class RestoreArgs:
+        from_path = str(db_path.parent)  # not a backup dir either
+        force = False
+
+    with pytest.raises(SystemExit):
+        cmd_restore(RestoreArgs())
+
+
+def test_manage_restore_force_overwrites_existing_data(monkeypatch, tmp_path):
+    from scripts.manage import cmd_backup, cmd_restore
+
+    db_path, tenants_dir = _make_site_data(tmp_path / "src")
+    monkeypatch.setattr(settings, "DB_PATH", db_path)
+    monkeypatch.setattr(settings, "TENANTS_DIR", tenants_dir)
+    monkeypatch.setattr(settings, "DATA_DIR", db_path.parent)
+
+    class BackupArgs:
+        out = str(tmp_path / "backups")
+
+    cmd_backup(BackupArgs())
+    b = next((tmp_path / "backups").iterdir())
+
+    # Destination has existing data that must be replaced by --force.
+    dst = tmp_path / "dst"
+    (dst / "tenants" / "acme" / "docs").mkdir(parents=True)
+    (dst / "tenants" / "acme" / "docs" / "stale.txt").write_text("old", encoding="utf-8")
+    (dst / "system.db").write_bytes(b"old db")
+    monkeypatch.setattr(settings, "DB_PATH", dst / "system.db")
+    monkeypatch.setattr(settings, "TENANTS_DIR", dst / "tenants")
+    monkeypatch.setattr(settings, "DATA_DIR", dst)
+
+    class RestoreArgs:
+        from_path = str(b)
+        force = True
+
+    cmd_restore(RestoreArgs())
+    assert not (dst / "tenants" / "acme" / "docs" / "stale.txt").exists()
+    assert (dst / "tenants" / "acme" / "docs" / "a.txt").read_text(encoding="utf-8") == "hello"

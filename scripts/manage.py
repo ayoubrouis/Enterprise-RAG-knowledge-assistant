@@ -12,13 +12,19 @@ Usage:
     python scripts/manage.py list-tenants
     python scripts/manage.py list-users --tenant acme
     python scripts/manage.py reset-password --username alice
+    python scripts/manage.py backup --out /mnt/backups       # DB + tenant data snapshot
+    python scripts/manage.py restore --from /mnt/backups/backup_20260809_120000  # restore (--force to overwrite)
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import secrets
+import shutil
+import sqlite3
 import sys
+import time
 from pathlib import Path
 
 # Make `app` importable when running this script from any directory.
@@ -145,6 +151,103 @@ def cmd_reset_password(args: argparse.Namespace) -> None:
         print(f"Generated password (shown once): {password}")
 
 
+def _sqlite_snapshot(src_path: Path, dst_path: Path) -> None:
+    """Consistent DB copy via the sqlite3 online-backup API (WAL-safe)."""
+    src = sqlite3.connect(str(src_path))
+    dst = sqlite3.connect(str(dst_path))
+    try:
+        with dst:
+            src.backup(dst)
+    finally:
+        src.close()
+        dst.close()
+
+
+def cmd_backup(args: argparse.Namespace) -> None:
+    """Snapshot the SQLite DB + all tenant data into a timestamped directory."""
+    if not settings.DB_PATH.exists():
+        print(f"Error: no database found at {settings.DB_PATH}. Nothing to back up.")
+        sys.exit(1)
+
+    out = Path(args.out) if args.out else settings.DATA_DIR / "backups"
+    out.mkdir(parents=True, exist_ok=True)
+
+    n = 0
+    while True:  # unique timestamped name (handles two runs in one second)
+        name = time.strftime("backup_%Y%m%d_%H%M%S")
+        if n:
+            name += f"_{n}"
+        dest = out / name
+        try:
+            dest.mkdir(parents=False)
+            break
+        except FileExistsError:
+            n += 1
+
+    _sqlite_snapshot(settings.DB_PATH, dest / settings.DB_PATH.name)
+    tenants = []
+    if settings.TENANTS_DIR.exists():
+        shutil.copytree(settings.TENANTS_DIR, dest / "tenants", dirs_exist_ok=True)
+        tenants = sorted(p.name for p in (dest / "tenants").iterdir() if p.is_dir())
+
+    (dest / "manifest.json").write_text(
+        json.dumps(
+            {
+                "created_at": time.time(),
+                "tool": "scripts/manage.py backup",
+                "db_file": settings.DB_PATH.name,
+                "tenants": tenants,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    print(f"Backup written to {dest}")
+    print(f"  DB snapshot : {settings.DB_PATH.name}")
+    print(f"  Tenants     : {', '.join(tenants) if tenants else '(none)'}")
+
+
+def cmd_restore(args: argparse.Namespace) -> None:
+    """Restore the DB + tenant data from a backup directory."""
+    src = Path(args.from_path)
+    db_backup = src / settings.DB_PATH.name
+    tenants_backup = src / "tenants"
+    if not db_backup.exists() and not tenants_backup.exists():
+        print(
+            f"Error: '{src}' is not a backup (no {settings.DB_PATH.name} or tenants/ found)."
+        )
+        sys.exit(1)
+
+    if not args.force:
+        existing = settings.DB_PATH.exists() or (
+            settings.TENANTS_DIR.exists() and any(settings.TENANTS_DIR.iterdir())
+        )
+        if existing:
+            print("Error: destination already contains data. Use --force to overwrite.")
+            sys.exit(1)
+
+    settings.DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if db_backup.exists():
+        for suffix in ("-wal", "-shm"):  # drop stale WAL sidecars of the current DB
+            Path(f"{settings.DB_PATH}{suffix}").unlink(missing_ok=True)
+        shutil.copy2(db_backup, settings.DB_PATH)
+
+    if tenants_backup.exists():
+        if settings.TENANTS_DIR.exists():
+            shutil.rmtree(settings.TENANTS_DIR)
+        shutil.copytree(tenants_backup, settings.TENANTS_DIR)
+
+    if db._CONN is not None:  # drop the old handle so the restored DB is reopened
+        db._CONN.close()
+        db._CONN = None
+
+    print(f"Restored from {src}")
+    print(f"  DB      : {settings.DB_PATH}")
+    print(f"  Tenants : {settings.TENANTS_DIR if tenants_backup.exists() else '(none in backup)'}")
+    print("If the API is running, restart it so in-memory pipelines reload restored indexes.")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -190,6 +293,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--username", required=True)
     p.add_argument("--password", default="")
     p.set_defaults(func=cmd_reset_password)
+
+    p = sub.add_parser("backup", help="Snapshot the DB + tenant data")
+    p.add_argument("--out", default="", help="Destination directory (default: data/backups)")
+    p.set_defaults(func=cmd_backup)
+
+    p = sub.add_parser("restore", help="Restore the DB + tenant data from a backup")
+    p.add_argument("--from", dest="from_path", required=True, help="Backup directory to restore from")
+    p.add_argument("--force", action="store_true", help="Overwrite existing data")
+    p.set_defaults(func=cmd_restore)
 
     return parser
 

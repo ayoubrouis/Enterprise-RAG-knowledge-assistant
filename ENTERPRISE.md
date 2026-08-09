@@ -200,6 +200,33 @@ data/     # tenant docs + FAISS indexes + system.db (auth + query logs)
 models/   # model weights (re-downloadable, optional to back up)
 ```
 
+### Recommended: `manage.py backup / restore`
+
+The CLI creates a WAL-safe SQLite snapshot (via the sqlite3 online-backup API) plus a
+copy of every tenant's data into a timestamped directory:
+
+```bash
+# Snapshot -> data/backups/backup_<date>_<time>/ (or any --out path)
+python scripts/manage.py backup
+python scripts/manage.py backup --out /mnt/backups
+
+# List your snapshots
+ls data/backups/
+```
+
+Restore into a fresh location, or over the current one with `--force` (stop the API
+first so it reopens the DB and reloads indexes):
+
+```bash
+python scripts/manage.py restore --from data/backups/backup_20260809_191030
+python scripts/manage.py restore --from /mnt/backups/backup_20260809_191030 --force
+```
+
+Restore refuses to overwrite existing data unless `--force` is given. Both commands
+honor `RAG_DATA_DIR` / `RAG_DB_PATH`, so you can restore into a relocated data folder.
+
+### Manual alternative
+
 ```bash
 tar -czf backup-$(date +%F).tgz data models
 # or, to exclude the (re-downloadable) models:
