@@ -1,0 +1,24 @@
+# Optional: serve the LLM with Ollama (free, open source; runs on CPU or GPU).
+#
+#   docker compose -f docker-compose.yml -f docker-compose.ollama.yml up -d
+#
+# Then pull a model on the host and restart the api service:
+#   docker compose exec ollama ollama pull qwen2.5:7b-instruct-q4_K_M
+#   docker compose up -d
+
+services:
+  ollama:
+    image: ollama/ollama:latest
+    volumes:
+      - ./data/ollama:/root/.ollama
+    ports:
+      - "11434:11434"
+    restart: unless-stopped
+
+  api:
+    environment:
+      RAG_LLM_BACKEND: openai
+      RAG_LLM_BASE_URL: http://ollama:11434
+      RAG_LLM_MODEL: ${OLLAMA_MODEL:-qwen2.5:7b-instruct-q4_K_M}
+    depends_on:
+      - ollama

@@ -1,0 +1,29 @@
+# ---- Machine learning / NLP (free & open-source, runs 100% locally) ----
+# torch is installed FIRST via the CPU index (see README) to keep it small
+# and avoid CUDA bloat on Windows/Linux. It is listed here too so the exact
+# version is documented; the CPU index wheel satisfies `torch==2.13.0`.
+torch==2.13.0
+transformers==5.14.1
+sentence-transformers==5.7.0
+
+# ---- LangChain ecosystem (orchestration) ----
+langchain==1.3.14
+langchain-community==0.4.2
+langchain-huggingface==1.2.2
+langchain-text-splitters==1.1.2
+faiss-cpu==1.15.0
+
+# ---- Document parsing ----
+pypdf==6.15.0
+docx2txt==0.9
+reportlab==5.0.0        # demo-data generation only (scripts/make_demo_data.py)
+
+# ---- Backend & UI ----
+fastapi==0.141.1
+uvicorn==0.52.1
+streamlit==1.61.1
+pandas==3.0.5
+
+# ---- Testing ----
+pytest==9.1.1
+httpx==0.28.1           # used by FastAPI TestClient

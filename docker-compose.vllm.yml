@@ -1,0 +1,40 @@
+# Optional: serve the LLM with vLLM on an NVIDIA GPU (free, MIT license).
+#
+#   docker compose -f docker-compose.yml -f docker-compose.vllm.yml up -d
+#
+# Requires: a Linux host with an NVIDIA GPU + the NVIDIA Container Toolkit
+# (nvidia-container-runtime). Qwen2.5-7B-Instruct-AWQ needs ~8 GB VRAM.
+#
+# The AWQ model repo on Hugging Face may require a token; set HF_TOKEN in
+# your .env if the pull is gated.
+
+services:
+  llm:
+    image: vllm/vllm-openai:latest
+    command:
+      - --model=${VLLM_MODEL:-Qwen/Qwen2.5-7B-Instruct-AWQ}
+      - --quantization=awq
+      - --max-model-len=8192
+      - --served-model-name=qwen2.5-7b
+    volumes:
+      - ./models:/models
+    environment:
+      HF_TOKEN: ${HF_TOKEN:-}
+    ports:
+      - "8001:8000"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+
+  api:
+    environment:
+      RAG_LLM_BACKEND: openai
+      RAG_LLM_BASE_URL: http://llm:8000
+      RAG_LLM_MODEL: qwen2.5-7b
+    depends_on:
+      - llm

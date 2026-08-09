@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+
+# Data artifacts (tenant docs + built indexes + auth db are user data, not code)
+data/tenants/
+data/system.db*
+data/_test_system.db*
+data/docs/
+data/vectorstore/
+data/ollama/
+
+# Local .env overrides (docker-compose uses .env; ship .env.example only)
+.env
+
+# Downloaded model weights (regenerate with scripts/download_model.py)
+models/
+
+# HuggingFace model caches (downloaded once, stored outside the repo)
+.huggingface/
+
+# Misc
+.DS_Store
+*.log
+.idea/
+.vscode/
