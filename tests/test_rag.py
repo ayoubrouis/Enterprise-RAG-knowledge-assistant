@@ -66,10 +66,14 @@ class FakePipeline:
         return {"documents": 1, "chunks": 5}
 
 
-ADMIN_CONTEXT = AuthContext(tenant_id="default", username="tester", role="admin", user_id=1)
-USER_CONTEXT = AuthContext(tenant_id="default", username="tester", role="user", user_id=1)
+ADMIN_CONTEXT = AuthContext(
+    tenant_id="default", username="tester", role="admin", subject="user:1", user_id=1
+)
+USER_CONTEXT = AuthContext(
+    tenant_id="default", username="tester", role="user", subject="user:1", user_id=1
+)
 SUPERADMIN_CONTEXT = AuthContext(
-    tenant_id="default", username="platform", role="superadmin", user_id=2
+    tenant_id="default", username="platform", role="superadmin", subject="user:2", user_id=2
 )
 
 
@@ -631,3 +635,56 @@ def test_rag_db_path_env_var_wins_over_data_dir(monkeypatch, tmp_path):
     s = Settings()
     assert s.DB_PATH == db_file
     assert s.DATA_DIR == tmp_path
+
+
+# ---------------------------------------------------------------------------
+# Query rate limiting (sliding window)
+# ---------------------------------------------------------------------------
+
+
+def test_rate_limiter_allows_up_to_limit_then_blocks():
+    from app.main import _SlidingWindowRateLimiter
+
+    limiter = _SlidingWindowRateLimiter(max_requests=3, window_seconds=60)
+    assert [limiter.allow("alice", now=100.0) for _ in range(3)] == [True, True, True]
+    assert limiter.allow("alice", now=105.0) is False  # over the limit
+    assert limiter.allow("bob", now=105.0) is True  # different caller unaffected
+
+
+def test_rate_limiter_window_slides_and_retry_after():
+    from app.main import _SlidingWindowRateLimiter
+
+    limiter = _SlidingWindowRateLimiter(max_requests=2, window_seconds=60)
+    assert limiter.allow("alice", now=100.0) is True
+    assert limiter.allow("alice", now=101.0) is True
+    assert limiter.allow("alice", now=101.0) is False
+    assert limiter.retry_after("alice", now=101.0) == pytest.approx(59.0)
+    # Oldest hit expires at 160.0, so a request at 160.0 is allowed again.
+    assert limiter.allow("alice", now=160.0) is True
+
+
+def test_rate_limiter_clear_and_prunes_old_entries():
+    from app.main import _SlidingWindowRateLimiter
+
+    limiter = _SlidingWindowRateLimiter(max_requests=1, window_seconds=10)
+    assert limiter.allow("a", now=100.0) is True
+    assert limiter.allow("a", now=100.0) is False
+    limiter.clear("a")
+    assert limiter.allow("a", now=100.0) is True
+    # A stale hit older than the window must not count against the caller.
+    assert limiter.allow("b", now=100.0) is True
+    assert limiter.allow("b", now=115.0) is True  # first hit expired
+
+
+def test_query_returns_429_when_rate_limit_exceeded(client, monkeypatch):
+    import app.main as main_mod
+
+    small = main_mod._SlidingWindowRateLimiter(max_requests=2, window_seconds=60)
+    monkeypatch.setattr(main_mod, "_query_rate_limiter", small)
+
+    assert client.post("/query", json={"question": "q1"}).status_code == 200
+    assert client.post("/query", json={"question": "q2"}).status_code == 200
+    blocked = client.post("/query", json={"question": "q3"})
+    assert blocked.status_code == 429
+    retry = int(blocked.headers["Retry-After"])
+    assert 1 <= retry <= 61  # within one window of the oldest hit

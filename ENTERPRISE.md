@@ -76,6 +76,8 @@ Set at minimum:
 | `RAG_PIPELINE_CACHE_SIZE` | Optional: max tenants whose FAISS indexes stay loaded in RAM (LRU, default 8). Raise on big-RAM boxes with many active tenants. |
 | `RAG_DATA_DIR`            | Optional: relocate the whole data folder (tenants/ + SQLite DB) to e.g. a mounted volume. Default: `<project>/data`. |
 | `RAG_DB_PATH`             | Optional: override just the SQLite auth database file (defaults to `$RAG_DATA_DIR/system.db`). |
+| `RAG_QUERY_RATE_LIMIT_MAX` | Optional: max `/query` calls per caller per sliding window (default 30). Guards the LLM+FAISS endpoint against abuse / runaway cost. |
+| `RAG_QUERY_RATE_LIMIT_WINDOW_SECONDS` | Optional: sliding window length for the above (default 60). |
 
 Generate a secret key:
 

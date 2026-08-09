@@ -127,6 +127,14 @@ class Settings:
     LOGIN_MAX_FAILURES_PER_IP: int = 20         # per source IP, per window
     LOGIN_FAILURE_WINDOW_SECONDS: int = 900     # rolling 15-minute window
 
+    # ---- Query rate limiting --------------------------------------------
+    # Sliding-window cap on /query (the expensive LLM + FAISS endpoint),
+    # enforced per authenticated caller (user or API key).
+    QUERY_RATE_LIMIT_MAX: int = int(os.environ.get("RAG_QUERY_RATE_LIMIT_MAX", "30"))
+    QUERY_RATE_LIMIT_WINDOW_SECONDS: int = int(
+        os.environ.get("RAG_QUERY_RATE_LIMIT_WINDOW_SECONDS", "60")
+    )
+
     # ---- Document chunking strategy -------------------------------------
     CHUNK_SIZE: int = 1000          # target characters per chunk
     CHUNK_OVERLAP: int = 150        # overlap keeps context across chunk edges

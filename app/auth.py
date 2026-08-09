@@ -24,6 +24,7 @@ class AuthContext:
     tenant_id: str
     username: str
     role: str
+    subject: str            # stable unique principal id (for rate limiting etc.)
     user_id: int | None = None
     via: str = "token"
 
@@ -40,7 +41,11 @@ def get_auth_context(
         if tenant is None or not tenant["is_active"]:
             raise HTTPException(status.HTTP_403_FORBIDDEN, "Tenant disabled")
         return AuthContext(
-            tenant_id=record["tenant_id"], username="api-key", role="user", via="api-key"
+            tenant_id=record["tenant_id"],
+            username="api-key",
+            role="user",
+            subject=f"apikey:{record['key_hash']}",
+            via="api-key",
         )
 
     if creds is None:
@@ -64,6 +69,7 @@ def get_auth_context(
         tenant_id=user["tenant_id"],
         username=user["username"],
         role=user["role"],
+        subject=f"user:{user['id']}",
         user_id=user["id"],
         via="token",
     )

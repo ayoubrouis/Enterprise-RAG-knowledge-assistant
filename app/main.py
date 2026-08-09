@@ -16,7 +16,7 @@ import secrets
 import shutil
 import threading
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -144,6 +144,73 @@ class _PipelineCache:
 
 
 _pipeline_cache = _PipelineCache(max_size=settings.PIPELINE_CACHE_SIZE)
+
+
+# ---------------------------------------------------------------------------
+# Query rate limiter (sliding window, per authenticated caller)
+# ---------------------------------------------------------------------------
+
+class _SlidingWindowRateLimiter:
+    """Thread-safe sliding-window limiter keyed by caller identity.
+
+    Each key keeps a deque of hit timestamps; hits older than the window are
+    dropped on access, so memory is bounded by the number of active callers.
+    """
+
+    def __init__(self, max_requests: int, window_seconds: int) -> None:
+        self.max_requests = max(1, max_requests)
+        self.window = max(1.0, float(window_seconds))
+        self._hits: dict[str, deque[float]] = {}
+        self._guard = threading.Lock()
+
+    def allow(self, key: str, now: float | None = None) -> bool:
+        """Record a hit; return False (without recording) when over the limit."""
+        now = time.monotonic() if now is None else now
+        cutoff = now - self.window
+        with self._guard:
+            q = self._hits.setdefault(key, deque())
+            while q and q[0] <= cutoff:
+                q.popleft()
+            if len(q) >= self.max_requests:
+                return False
+            q.append(now)
+            return True
+
+    def retry_after(self, key: str, now: float | None = None) -> float:
+        """Seconds until the oldest hit expires (0.0 when not limited)."""
+        now = time.monotonic() if now is None else now
+        with self._guard:
+            q = self._hits.get(key)
+            if not q:
+                return 0.0
+            return max(0.0, q[0] + self.window - now)
+
+    def clear(self, key: str) -> None:
+        with self._guard:
+            self._hits.pop(key, None)
+
+    def __len__(self) -> int:
+        with self._guard:
+            return len(self._hits)
+
+
+_query_rate_limiter = _SlidingWindowRateLimiter(
+    max_requests=settings.QUERY_RATE_LIMIT_MAX,
+    window_seconds=settings.QUERY_RATE_LIMIT_WINDOW_SECONDS,
+)
+
+
+def enforce_query_rate_limit(auth: AuthContext) -> None:
+    """429 when the caller has exceeded their sliding-window /query budget."""
+    key = f"{auth.tenant_id}:{auth.subject}"
+    if _query_rate_limiter.allow(key):
+        return
+    retry = int(_query_rate_limiter.retry_after(key)) + 1
+    raise HTTPException(
+        status_code=429,
+        detail=f"Rate limit exceeded. Retry in {retry}s.",
+        headers={"Retry-After": str(retry)},
+    )
 
 
 def get_pipeline(tenant_id: str) -> RAGPipeline:
@@ -291,6 +358,7 @@ def query(
     auth: AuthContext = Depends(get_auth_context),
     pipeline: RAGPipeline | None = Depends(get_pipeline_for_auth),
 ) -> QueryResponse:
+    enforce_query_rate_limit(auth)
     if pipeline is None:
         raise HTTPException(400, "No documents indexed for this tenant yet.")
     start = time.perf_counter()
