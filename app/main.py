@@ -676,7 +676,6 @@ def login(request: LoginRequest, req: Request) -> LoginResponse:
     user_mfa_enabled = is_mfa_enabled(user["id"])
     if user_mfa_enabled:
         # Return a short-lived MFA token instead of a real session token
-        import secrets as _secrets
         mfa_token = make_login_token({
             **user,
             "token_version": user.get("token_version", 0),
@@ -780,7 +779,6 @@ def mfa_setup(
     secret = get_mfa_qr(auth.user_id)
     if secret is None:
         from app.mfa import generate_mfa_secret, get_totp_uri, generate_qr_data_url
-        from app.config import settings as _s
         new_secret = generate_mfa_secret()
         db.set_user_mfa(auth.user_id, new_secret, enabled=False)
         uri = get_totp_uri(new_secret, auth.username)
@@ -990,7 +988,6 @@ def upload_document(
     # Encrypt at rest if configured
     if is_encryption_enabled():
         from app.encryption import encrypt_file
-        import tempfile
         tmp = dest.with_suffix(dest.suffix + ".tmp")
         dest.rename(tmp)
         encrypt_file(tmp, dest)

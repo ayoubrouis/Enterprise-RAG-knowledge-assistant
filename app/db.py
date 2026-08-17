@@ -508,7 +508,6 @@ def set_tenant_active(tenant_id: str, active: bool) -> None:
 
 
 def count_users(tenant_id: str) -> int:
-    col = "c"
     row = _execute(
         "SELECT COUNT(*) AS c FROM users WHERE tenant_id = %s" if _USE_PG else "SELECT COUNT(*) AS c FROM users WHERE tenant_id = ?",
         (tenant_id,), fetchone=True,

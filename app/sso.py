@@ -89,7 +89,8 @@ def oidc_exchange_code(code: str) -> dict:
     tokens = resp.json()
 
     # Verify the ID token (in production, verify signature via JWKS).
-    import base64, json
+    import base64
+    import json
 
     id_token = tokens.get("id_token", "")
     try:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -421,7 +422,6 @@ def test_enterprise_admin_cannot_escalate_to_superadmin(client):
 def test_enterprise_admin_manages_own_tenant(client):
     import uuid
 
-    import app.db as db
 
     username = f"carol-{uuid.uuid4().hex[:6]}"
     created = client.post(
@@ -501,12 +501,12 @@ def test_enterprise_admin_logs_scoped_to_own_tenant(client):
 
     # Even asking for another tenant's logs yields only the caller's.
     logs = client.get("/admin/logs?tenant_id=acme").json()
-    assert all(l["tenant_id"] == "default" for l in logs)
+    assert all(entry["tenant_id"] == "default" for entry in logs)
 
 
 def test_superadmin_sees_all_logs(super_client):
     logs = super_client.get("/admin/logs").json()
-    tenant_ids = {l["tenant_id"] for l in logs}
+    tenant_ids = {entry["tenant_id"] for entry in logs}
     assert "default" in tenant_ids and "acme" in tenant_ids
 
 
@@ -1013,7 +1013,7 @@ def test_change_password_rejects_api_key_auth(fresh_client):
     """API-key callers have no user_id and no stored password to verify."""
     import app.db as db
 
-    setup = fresh_client.post(
+    fresh_client.post(
         "/auth/setup",
         json={
             "tenant_name": "Acme Corp",
@@ -1460,7 +1460,6 @@ def test_rate_limit_headers_on_429(anon_client, monkeypatch):
 
 
 def test_alert_rules_is_valid_yaml():
-    import json
     from pathlib import Path
 
     rules_path = Path(__file__).resolve().parent.parent / "monitoring" / "alert-rules.yml"
@@ -1605,7 +1604,6 @@ def test_mfa_totp_generation_and_verification():
 def test_mfa_enable_disable_flow(anon_client):
     """Enable and disable MFA via the API."""
     import app.db as db
-    from app.mfa import generate_mfa_secret
     import pyotp
 
     # Create a user
@@ -1673,7 +1671,7 @@ def test_mfa_verify_rejects_bad_code(client):
 def test_mfa_validate_exchanges_token(anon_client):
     """MFA validate should exchange mfa_token + code for a real session."""
     import app.db as db
-    from app.mfa import generate_mfa_secret, enable_mfa
+    from app.mfa import generate_mfa_secret
     import pyotp
 
     user = db.create_user("default", "mfa_validate_user", "Passw0rd123!", "user")
@@ -1761,7 +1759,6 @@ def test_granular_roles_in_schema(anon_client):
 def test_login_mfa_required_flow(client):
     """Login should return mfa_required when MFA is enabled."""
     import app.db as db
-    import pyotp
     from app.mfa import generate_mfa_secret
 
     user = db.create_user("default", "login_mfa_user", "Passw0rd123!", "user")
@@ -1780,7 +1777,6 @@ def test_login_mfa_required_flow(client):
 
 def test_postgresql_configurable():
     """DATABASE_URL env var should activate PostgreSQL mode."""
-    from app.config import Settings
     import os
 
     old = os.environ.get("RAG_DATABASE_URL", "")

@@ -10,7 +10,6 @@ Label sets are sorted so the same label set always produces the same key.
 
 from __future__ import annotations
 
-import re
 import threading
 from collections import Counter, defaultdict
 from typing import Iterable
