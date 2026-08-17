@@ -21,7 +21,7 @@ class QueryResponse(BaseModel):
     question: str
     answer: str
     sources: list[Source]
-    grounded: bool = True  # False when the grounding guardrail replaced the answer
+    grounded: bool = True
 
 
 class StatsResponse(BaseModel):
@@ -51,11 +51,43 @@ class JobStatus(BaseModel):
 class DocumentInfo(BaseModel):
     filename: str
     size: int
+    encrypted: bool = False
 
 
 class LoginRequest(BaseModel):
     username: str = Field(min_length=1, max_length=128)
     password: str = Field(min_length=1, max_length=256)
+
+
+class LoginResponse(BaseModel):
+    token: str
+    token_type: str
+    username: str
+    role: str
+    tenant_id: str
+    tenant_name: str
+    mfa_required: bool = False
+    mfa_token: str | None = None
+
+
+class MFASetupResponse(BaseModel):
+    secret: str
+    qr_code_url: str  # data:image/png;base64,...
+    message: str = "Scan the QR code with your authenticator app, then call POST /auth/mfa/verify with the 6-digit code."
+
+
+class MFAVerifyRequest(BaseModel):
+    code: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
+
+
+class MFAVerifyResponse(BaseModel):
+    success: bool
+    message: str
+
+
+class MFAValidateRequest(BaseModel):
+    mfa_token: str
+    code: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
 
 
 class ChangePasswordRequest(BaseModel):
@@ -86,20 +118,12 @@ class SetupRequest(BaseModel):
     password: str = Field(min_length=8, max_length=256)
 
 
-class LoginResponse(BaseModel):
-    token: str
-    token_type: str
-    username: str
-    role: str
-    tenant_id: str
-    tenant_name: str
-
-
 class MeResponse(BaseModel):
     username: str
     role: str
     tenant_id: str
     via: str
+    mfa_enabled: bool = False
 
 
 class TenantCreate(BaseModel):
@@ -123,9 +147,8 @@ class TenantOut(BaseModel):
 
 class UserCreate(BaseModel):
     username: str = Field(min_length=3, max_length=64, pattern=r"^[a-zA-Z0-9_.-]+$")
-    # Empty password => a strong random one is generated and returned once.
     password: str = Field(default="", max_length=256)
-    role: str = Field(default="user", pattern=r"^(superadmin|admin|user)$")
+    role: str = Field(default="user", pattern=r"^(superadmin|admin|user|uploader|viewer)$")
 
 
 class UserUpdate(BaseModel):
@@ -138,11 +161,11 @@ class UserOut(BaseModel):
     username: str
     role: str
     is_active: bool
+    mfa_enabled: bool = False
     created_at: float
 
 
 class UserCreated(UserOut):
-    # Populated only when the password was auto-generated (shown once).
     password: str | None = None
 
 
@@ -186,3 +209,17 @@ class QueryLogOut(BaseModel):
     answer: str | None
     latency_ms: float | None
     created_at: float
+
+
+# SSO
+class SSOLoginRequest(BaseModel):
+    code: str = Field(default="", description="OIDC authorization code")
+
+
+class SSOCallbackResponse(BaseModel):
+    token: str
+    token_type: str = "bearer"
+    username: str
+    role: str
+    tenant_id: str
+    tenant_name: str

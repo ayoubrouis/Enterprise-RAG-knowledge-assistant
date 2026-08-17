@@ -1,5 +1,69 @@
 # Changelog
 
+## v2.1.0 — Major Upgrade (v1.1 branch)
+
+Adds PostgreSQL, SSO/OIDC/LDAP, TOTP-based MFA, at-rest encryption, CI/CD,
+and expanded role definitions. **93 tests**, all passing.
+
+### PostgreSQL support
+
+- `app/db.py` rewritten with dual-backend: PostgreSQL (`psycopg2.pool.ThreadedConnectionPool`, 2–20 conns) + SQLite fallback.
+- Set `RAG_DATABASE_URL=postgresql://user:pass@localhost:5432/rag` to enable PostgreSQL.
+- Thread-safe pool with checkout/return, `statement_timeout=30s`, idempotent schema creation.
+- All CRUD functions work identically on both backends; switching requires only an env var change.
+
+### SSO / OIDC / LDAP
+
+- `app/sso.py` — OAuth2/OIDC (discovery doc, authorization URL, code exchange via `httpx`) + LDAP (`ldap3` bind/search/authenticate).
+- `sso_authenticate()` unified entry point; `provision_sso_user()` auto-creates local users from SSO claims.
+- Endpoints: `GET /auth/sso/login`, `GET /auth/sso/callback`.
+
+### Multi-Factor Authentication (TOTP)
+
+- `app/mfa.py` — TOTP generation/verification via `pyotp`, QR codes via `qrcode[pil]`.
+- `enable_mfa()` / `disable_mfa()` / `verify_totp()` with ±1 window for clock skew.
+- Endpoints: `POST /auth/mfa/setup`, `POST /auth/mfa/verify`, `POST /auth/mfa/disable`, `POST /auth/mfa/validate`.
+- Login flow supports `mfa_required` response; `mfa_token` exchanges with TOTP code.
+
+### At-rest encryption
+
+- `app/encryption.py` — Fernet (AES-128-CBC + HMAC-SHA256) via `cryptography`.
+- PBKDF2 key derivation from `RAG_ENCRYPTION_KEY`; transparent encrypt-on-upload, decrypt-on-read.
+- Set `RAG_ENCRYPTION_KEY` to enable; empty (default) = plaintext passthrough.
+- Documents show encryption status in API responses (`encrypted` field).
+
+### Granular roles
+
+- Added `uploader` and `viewer` roles (5 total: `superadmin`, `admin`, `user`, `uploader`, `viewer`).
+- Schema CHECK constraint updated; SQLite migration rebuilds users table when outdated.
+
+### CI/CD
+
+- `.github/workflows/ci.yml` — ruff lint + pytest + Docker build on push to `main`/`v1.1` and PRs.
+- Python 3.11/3.12 matrix.
+
+### Docker Compose
+
+- Added `postgres` service (16-alpine, healthcheck, pgdata volume).
+- API depends on postgres with healthcheck; all new env vars passed through.
+
+### Dependencies added
+
+`psycopg2-binary`, `pyotp`, `qrcode[pil]`, `cryptography`, `httpx`.
+
+### Bug fixes
+
+- `test_mfa_enable_disable_flow` — fixed stale auth dependency override (now uses `anon_client`).
+- `test_encryption_module` — `encryption.py` reads `ENCRYPTION_KEY` from env directly (avoids stale singleton after `reload(config)`).
+- `_migrate_sqlite()` properly rebuilds users table when role CHECK constraint is outdated.
+- `conftest.py` removes `RAG_DATABASE_URL` to ensure tests use SQLite.
+
+### New tests (12)
+
+MFA flow, MFA bad code, MFA validate, MFA validate bad code, encryption round-trip, granular roles, login MFA flow, PostgreSQL config, `me` mfa_enabled.
+
+---
+
 ## v2.0.0 — Enterprise Hardening
 
 Major release transforming the single-tenant prototype into a production-ready,

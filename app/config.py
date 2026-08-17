@@ -22,7 +22,6 @@ class Settings:
 
     def __init__(self) -> None:
         # Fail closed: refuse to boot unless a strong signing secret is set.
-        # The dev escape hatch below is opt-in and only for local development.
         known_insecure = {"dev-secret-change-me", "change-me-to-a-long-random-string"}
         if not self.SECRET_KEY and self.ALLOW_INSECURE_DEV_KEY:
             self.SECRET_KEY = "dev-secret-change-me"
@@ -52,9 +51,13 @@ class Settings:
     # ---- Paths (relative to the project root) ---------------------------
     ROOT_DIR: Path = Path(__file__).resolve().parent.parent
 
+    # ---- Database -------------------------------------------------------
+    # Set RAG_DATABASE_URL to use PostgreSQL in production.
+    # Example: postgresql://user:password@localhost:5432/rag
+    # When empty (default), SQLite is used (zero setup, perfect for dev/tests).
+    DATABASE_URL: str = os.environ.get("RAG_DATABASE_URL", "")
+
     # ---- Tenancy ----------------------------------------------------------
-    # The tenant used for local development and by scripts that predate the
-    # multi-tenant layout. API users always resolve their tenant from auth.
     DEFAULT_TENANT: str = os.environ.get("RAG_DEFAULT_TENANT_ID", "default")
 
     def tenant_docs_dir(self, tenant_id: str) -> Path:
@@ -67,7 +70,6 @@ class Settings:
         self.tenant_docs_dir(tenant_id).mkdir(parents=True, exist_ok=True)
         self.tenant_vectorstore_dir(tenant_id).mkdir(parents=True, exist_ok=True)
 
-    # Backwards-compatible helpers pointing at the default tenant.
     @property
     def DOCS_DIR(self) -> Path:
         return self.tenant_docs_dir(self.DEFAULT_TENANT)
@@ -77,119 +79,63 @@ class Settings:
         return self.tenant_vectorstore_dir(self.DEFAULT_TENANT)
 
     # ---- Models (free, open source, local) ------------------------------
-    # Small, fast embedding model - excellent quality/size trade-off.
     EMBEDDING_MODEL: str = "sentence-transformers/all-MiniLM-L6-v2"
-    # Instruction-tuned encoder-decoder LLM that extracts grounded answers
-    # well and runs acceptably on CPU. Swap to "google/flan-t5-large" for a
-    # higher-quality but slower model.
     LLM_MODEL: str = os.environ.get("RAG_LLM_MODEL", "google/flan-t5-base")
 
     # ---- LLM backend ------------------------------------------------------
-    # "transformers"  -> in-process Hugging Face model (default; works on any
-    #                    CPU, zero extra services). Model: LLM_MODEL above.
-    # "openai"        -> any OpenAI-compatible inference server, e.g.:
-    #                      * Ollama (CPU or GPU) - set RAG_LLM_BASE_URL to
-    #                        http://host:11434 and RAG_LLM_MODEL to an Ollama
-    #                        tag such as "qwen2.5:7b-instruct-q4_K_M"
-    #                      * vLLM (NVIDIA GPU) - set RAG_LLM_BASE_URL to
-    #                        http://host:8000 and RAG_LLM_MODEL to the served
-    #                        model name (e.g. "Qwen/Qwen2.5-7B-Instruct-AWQ")
     LLM_BACKEND: str = os.environ.get("RAG_LLM_BACKEND", "transformers")
     LLM_BASE_URL: str = os.environ.get("RAG_LLM_BASE_URL", "http://127.0.0.1:11434")
     LLM_API_KEY: str = os.environ.get("RAG_LLM_API_KEY", "")
 
     # ---- Auth -------------------------------------------------------------
-    # Signing secret for login tokens. REQUIRED: the app refuses to start
-    # without one (>= 16 characters) so a deployment can never silently run
-    # with a known default key. Generate one with:
-    #   python -c "import secrets; print(secrets.token_urlsafe(48))"
-    # For quick local development ONLY you may set RAG_ALLOW_INSECURE_DEV_KEY=1
-    # to fall back to a fixed dev key - never do this in production.
     SECRET_KEY: str = os.environ.get("RAG_SECRET_KEY", "").strip()
     ALLOW_INSECURE_DEV_KEY: bool = os.environ.get("RAG_ALLOW_INSECURE_DEV_KEY", "") == "1"
     TOKEN_TTL_SECONDS: int = int(os.environ.get("RAG_TOKEN_TTL_SECONDS", str(12 * 3600)))
     ADMIN_USERNAME: str = os.environ.get("RAG_ADMIN_USERNAME", "admin")
-    # Leave empty for the first-run setup wizard (interactive installs): the UI
-    # shows a one-time "create your enterprise + admin" page, and afterwards it
-    # is sign-in only. Set it for unattended deploys (e.g. Docker CI) so the
-    # admin is auto-seeded at first boot with this password.
     ADMIN_PASSWORD: str = os.environ.get("RAG_ADMIN_PASSWORD", "")
 
     # ---- Password hashing -------------------------------------------------
-    # OWASP-recommended PBKDF2-HMAC-SHA256 cost factor. Existing hashes store
-    # their own iteration count, so a running system rehashes on the next
-    # successful login whenever this value changes (see app/security.py).
     PBKDF2_ITERATIONS: int = int(os.environ.get("RAG_PBKDF2_ITERATIONS", "600000"))
 
     # ---- Upload limits ----------------------------------------------------
-    # Hard cap on a single uploaded document (MiB). Prevents a runaway upload
-    # from filling the disk; rejects with 413 when exceeded.
     MAX_UPLOAD_MB: int = int(os.environ.get("RAG_MAX_UPLOAD_MB", "50"))
 
     # ---- Answer grounding (hallucination guardrail) -----------------------
-    # After the LLM generates an answer, the pipeline checks that a meaningful
-    # fraction of the answer's content words actually appear in the retrieved
-    # context. When the answer is unsupported (or the check cannot be judged),
-    # the pipeline replies "I don't know." instead of surfacing a fabrication.
     GROUNDING_CHECK: bool = os.environ.get("RAG_GROUNDING_CHECK", "1") == "1"
-    GROUNDING_MIN_OVERLAP: float = float(
-        os.environ.get("RAG_GROUNDING_MIN_OVERLAP", "0.5")
-    )
+    GROUNDING_MIN_OVERLAP: float = float(os.environ.get("RAG_GROUNDING_MIN_OVERLAP", "0.5"))
     GROUNDING_MIN_TOKENS: int = int(os.environ.get("RAG_GROUNDING_MIN_TOKENS", "4"))
 
     # ---- Audit log --------------------------------------------------------
-    # Admin/auth actions are written to an append-only audit table. Old rows
-    # are pruned opportunistically (on insert) beyond this retention window.
-    AUDIT_LOG_RETENTION_DAYS: int = int(
-        os.environ.get("RAG_AUDIT_LOG_RETENTION_DAYS", "365")
-    )
+    AUDIT_LOG_RETENTION_DAYS: int = int(os.environ.get("RAG_AUDIT_LOG_RETENTION_DAYS", "365"))
 
     # ---- UI ----------------------------------------------------------------
-    # Where the Streamlit UI (a separate process) reaches the FastAPI backend.
     API_BASE_URL: str = os.environ.get("RAG_API_BASE_URL", "http://127.0.0.1:8000")
 
     # ---- CORS -----------------------------------------------------------
-    # Comma-separated list of allowed origins for cross-origin requests.
-    # In production, set this to your frontend origin(s) only. The Streamlit
-    # UI runs on the same host by default.
     CORS_ORIGINS: str = os.environ.get("RAG_CORS_ORIGINS", "")
 
     # ---- Brute-force protection ---------------------------------------
-    # Login failures are recorded per (username, ip) and enforced inside a
-    # rolling window. Exceeding the per-username limit locks that account;
-    # exceeding the per-IP limit throttles the whole source address.
     LOGIN_MAX_FAILURES: int = int(os.environ.get("RAG_LOGIN_MAX_FAILURES", "5"))
     LOGIN_MAX_FAILURES_PER_IP: int = int(os.environ.get("RAG_LOGIN_MAX_FAILURES_PER_IP", "20"))
     LOGIN_FAILURE_WINDOW_SECONDS: int = int(os.environ.get("RAG_LOGIN_FAILURE_WINDOW_SECONDS", "900"))
 
     # ---- Query rate limiting --------------------------------------------
-    # Sliding-window cap on /query (the expensive LLM + FAISS endpoint),
-    # enforced per authenticated caller (user or API key).
     QUERY_RATE_LIMIT_MAX: int = int(os.environ.get("RAG_QUERY_RATE_LIMIT_MAX", "30"))
-    QUERY_RATE_LIMIT_WINDOW_SECONDS: int = int(
-        os.environ.get("RAG_QUERY_RATE_LIMIT_WINDOW_SECONDS", "60")
-    )
+    QUERY_RATE_LIMIT_WINDOW_SECONDS: int = int(os.environ.get("RAG_QUERY_RATE_LIMIT_WINDOW_SECONDS", "60"))
 
     # ---- Global rate limiting -------------------------------------------
-    # Per-IP sliding-window cap on ALL requests. Protects against DoS from
-    # unauthenticated or low-privilege callers.
     GLOBAL_RATE_LIMIT_MAX: int = int(os.environ.get("RAG_GLOBAL_RATE_LIMIT_MAX", "120"))
-    GLOBAL_RATE_LIMIT_WINDOW_SECONDS: int = int(
-        os.environ.get("RAG_GLOBAL_RATE_LIMIT_WINDOW_SECONDS", "60")
-    )
+    GLOBAL_RATE_LIMIT_WINDOW_SECONDS: int = int(os.environ.get("RAG_GLOBAL_RATE_LIMIT_WINDOW_SECONDS", "60"))
 
     # ---- Document chunking strategy -------------------------------------
-    CHUNK_SIZE: int = 1000          # target characters per chunk
-    CHUNK_OVERLAP: int = 150        # overlap keeps context across chunk edges
+    CHUNK_SIZE: int = 1000
+    CHUNK_OVERLAP: int = 150
 
     # ---- Per-tenant pipeline cache -------------------------------------
-    # A tenant's RAGPipeline holds its FAISS index in memory. The cache is an
-    # LRU: at most this many tenants' indexes stay loaded at once, so a box
-    # with many tenants does not accumulate unbounded RAM.
     PIPELINE_CACHE_SIZE: int = int(os.environ.get("RAG_PIPELINE_CACHE_SIZE", "8"))
 
     # ---- Retrieval ------------------------------------------------------
-    TOP_K: int = 4                  # how many chunks to feed the LLM
+    TOP_K: int = 4
 
     # ---- Generation -----------------------------------------------------
     MAX_NEW_TOKENS: int = 256
@@ -203,6 +149,29 @@ class Settings:
 
     # ---- Supported source formats ---------------------------------------
     SUPPORTED_EXTENSIONS: tuple[str, ...] = (".pdf", ".txt", ".md", ".docx")
+
+    # ---- SSO / OIDC ----------------------------------------------------
+    SSO_ENABLED: bool = os.environ.get("RAG_SSO_ENABLED", "") == "1"
+    SSO_PROVIDER: str = os.environ.get("RAG_SSO_PROVIDER", "oidc")  # oidc | ldap
+    SSO_DEFAULT_TENANT: str = os.environ.get("RAG_SSO_DEFAULT_TENANT", "default")
+
+    # OIDC settings
+    OIDC_ISSUER_URL: str = os.environ.get("RAG_OIDC_ISSUER_URL", "")
+    OIDC_CLIENT_ID: str = os.environ.get("RAG_OIDC_CLIENT_ID", "")
+    OIDC_CLIENT_SECRET: str = os.environ.get("RAG_OIDC_CLIENT_SECRET", "")
+    OIDC_REDIRECT_URI: str = os.environ.get("RAG_OIDC_REDIRECT_URI", "http://localhost:8000/auth/sso/callback")
+
+    # LDAP settings
+    LDAP_SERVER_URL: str = os.environ.get("RAG_LDAP_SERVER_URL", "ldap://localhost:389")
+    LDAP_BIND_DN: str = os.environ.get("RAG_LDAP_BIND_DN", "")
+    LDAP_BIND_PASSWORD: str = os.environ.get("RAG_LDAP_BIND_PASSWORD", "")
+    LDAP_USER_SEARCH_BASE: str = os.environ.get("RAG_LDAP_USER_SEARCH_BASE", "")
+    LDAP_USER_SEARCH_FILTER: str = os.environ.get("RAG_LDAP_USER_SEARCH_FILTER", "(uid={username})")
+
+    # ---- At-rest encryption ---------------------------------------------
+    # Set RAG_ENCRYPTION_KEY to enable Fernet encryption for uploaded documents.
+    # When empty (default), documents are stored plaintext.
+    ENCRYPTION_KEY: str = os.environ.get("RAG_ENCRYPTION_KEY", "")
 
 
 settings = Settings()

@@ -20,6 +20,10 @@ Customer network
 │   :8501        (login/upload)    :8000     transformers /     │
 │                                          Ollama / vLLM        │
 │                                              │                │
+│                                    ┌─────────┴─────────┐     │
+│                                    │  PostgreSQL (opt.) │     │
+│                                    │  :5432             │     │
+│                                    └───────────────────┘     │
 │                                    data/ + models/ volumes    │
 │                                    (tenant docs + FAISS +     │
 │                                     auth db + model weights)  │
@@ -90,6 +94,19 @@ Set at minimum:
 | `RAG_CORS_ORIGINS` | Optional: comma-separated list of allowed CORS origins. Leave empty for all origins (dev). In production set to your frontend origin(s), e.g. `https://rag.example.com`. |
 | `RAG_GLOBAL_RATE_LIMIT_MAX` | Optional: per-IP sliding-window cap on ALL requests (default 120/min). Protects against DoS. |
 | `RAG_TOKEN_TTL_SECONDS` | Optional: login token time-to-live in seconds (default 43200 = 12h). Tokens expire automatically; use change-password or logout to revoke early. |
+| `RAG_DATABASE_URL` | Optional: PostgreSQL connection string (e.g. `postgresql://user:pass@localhost:5432/rag`). When empty (default), SQLite is used. |
+| `RAG_ENCRYPTION_KEY` | Optional: enable at-rest Fernet encryption for uploaded documents. When empty (default), documents are stored plaintext. Set to a long random string to enable. |
+| `RAG_SSO_ENABLED` | Optional: set `1` to enable SSO login. Requires `RAG_SSO_PROVIDER` and provider-specific settings below. |
+| `RAG_SSO_PROVIDER` | Optional: `oidc` (default) or `ldap`. |
+| `RAG_OIDC_ISSUER_URL` | OIDC issuer URL for discovery (e.g. `https://accounts.google.com`). |
+| `RAG_OIDC_CLIENT_ID` | OIDC client ID from your identity provider. |
+| `RAG_OIDC_CLIENT_SECRET` | OIDC client secret. |
+| `RAG_OIDC_REDIRECT_URI` | OIDC callback URL (default `http://localhost:8000/auth/sso/callback`). |
+| `RAG_LDAP_SERVER_URL` | LDAP server URL (default `ldap://localhost:389`). |
+| `RAG_LDAP_BIND_DN` | LDAP bind DN for service account. |
+| `RAG_LDAP_BIND_PASSWORD` | LDAP bind password. |
+| `RAG_LDAP_USER_SEARCH_BASE` | LDAP base DN for user search. |
+| `RAG_LDAP_USER_SEARCH_FILTER` | LDAP search filter (default `(uid={username})`). |
 
 Generate a secret key:
 
@@ -360,12 +377,23 @@ Common issues:
 - Individual sessions can be **revoked via logout** (`POST /auth/logout`) without affecting
   other sessions. Each token carries a unique `jti` (token id); logout stores it in a
   revocation list checked on every request.
+- **Multi-Factor Authentication (MFA):** enable TOTP-based MFA per user via the API
+  (`POST /auth/mfa/setup` + `POST /auth/mfa/verify`). Once enabled, login requires a
+  second step: the login endpoint returns `mfa_required: true` + a `mfa_token`, which
+  must be exchanged with a 6-digit TOTP code via `POST /auth/mfa/validate`.
+- **SSO / OIDC / LDAP:** integrate with external identity providers for centralized
+  authentication. Users are auto-provisioned on first SSO login. Set `RAG_SSO_ENABLED=1`
+  and configure the provider settings in `.env`.
+- **At-rest encryption:** set `RAG_ENCRYPTION_KEY` to enable Fernet encryption for all
+  uploaded documents. Documents are encrypted on upload and decrypted transparently on
+  read. The key is derived via PBKDF2 (100k iterations).
 - API keys can be **disabled** (temporarily, `PATCH`) or **revoked** (permanently,
   `DELETE`) from the admin UI/API/CLI. Rotate credentials by disabling the old key and
   issuing a new one — the old key stops authenticating immediately.
 - Every admin/auth action lands in the **audit log** (`GET /admin/audit-logs`): setup,
-  successful and failed logins, password changes, user/API-key/tenant management, and
-  document uploads/deletes. It is append-only and pruned only by retention age.
+  successful and failed logins, password changes, user/API-key/tenant management, MFA
+  enable/disable, and document uploads/deletes. It is append-only and pruned only by
+  retention age.
 - Uploads are capped (`RAG_MAX_UPLOAD_MB`, default 50 MiB) — a runaway upload cannot fill
   the disk, and oversized files are rejected with 413 leaving no partial file.
 - A grounding guardrail validates each LLM answer against the retrieved context before it
@@ -387,7 +415,7 @@ Common issues:
 - **CORS** is configurable via `RAG_CORS_ORIGINS`. Defaults to `*` for development;
   set an explicit allowlist in production.
 - The auth DB stores only PBKDF2 password hashes and SHA-256 API key hashes — no
-  plaintext credentials.
+  plaintext credentials. MFA secrets and encrypted document keys are also stored securely.
 - Tenants are isolated on disk; enabling multi-tenancy on one box keeps each tenant's
   documents and index separate.
 - **Information-leak prevention:** disabled accounts return the same 401 as wrong-password
@@ -398,6 +426,10 @@ Common issues:
 - **Token hygiene:** expired revoked tokens are pruned on startup; the rate limiter
   reclaims memory from inactive IPs. The `X-Request-ID` header is sanitized against
   log-injection and header-abuse attacks.
+- **Database flexibility:** use PostgreSQL in production for ACID guarantees, connection
+  pooling, and multi-process safety; SQLite remains the zero-config default for dev/tests.
+- **CI/CD:** automated linting (ruff) + testing + Docker build on every push via GitHub
+  Actions; Python 3.11/3.12 matrix ensures broad compatibility.
 
 ---
 

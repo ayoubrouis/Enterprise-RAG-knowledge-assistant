@@ -1,29 +1,41 @@
 # ---- Machine learning / NLP (free & open-source, runs 100% locally) ----
-# torch is installed FIRST via the CPU index (see README) to keep it small
-# and avoid CUDA bloat on Windows/Linux. It is listed here too so the exact
-# version is documented; the CPU index wheel satisfies `torch==2.13.0`.
-torch==2.13.0
-transformers==5.14.1
-sentence-transformers==5.7.0
+torch>=2.5.0
+transformers>=4.48.0
+sentence-transformers>=3.0.0
 
 # ---- LangChain ecosystem (orchestration) ----
-langchain==1.3.14
-langchain-community==0.4.2
-langchain-huggingface==1.2.2
-langchain-text-splitters==1.1.2
-faiss-cpu==1.15.0
+langchain>=1.0.0
+langchain-community>=0.4.0
+langchain-huggingface>=1.2.0
+langchain-text-splitters>=1.1.0
+faiss-cpu>=1.7.0
 
 # ---- Document parsing ----
-pypdf==6.15.0
-docx2txt==0.9
-reportlab==5.0.0        # demo-data generation only (scripts/make_demo_data.py)
+pypdf>=4.0.0
+docx2txt>=0.9
+reportlab>=4.0.0
 
 # ---- Backend & UI ----
-fastapi==0.141.1
-uvicorn==0.52.1
-streamlit==1.61.1
-pandas==3.0.5
+fastapi>=0.110.0
+uvicorn>=0.30.0
+streamlit>=1.40.0
+pandas>=2.0.0
+
+# ---- Database ----
+psycopg2-binary>=2.9.0  # PostgreSQL adapter (production)
+
+# ---- SSO / OIDC ----
+httpx>=0.27.0            # HTTP client for OIDC discovery + token exchange
+
+# ---- MFA (TOTP) ----
+pyotp>=2.9.0             # TOTP generation + verification
+qrcode[pil]>=7.0         # QR code generation for authenticator apps
+
+# ---- Encryption at rest ----
+cryptography>=43.0.0     # Fernet symmetric encryption
+
+# ---- LDAP (optional) ----
+# ldap3>=2.9.1           # Uncomment for LDAP SSO support
 
 # ---- Testing ----
-pytest==9.1.1
-httpx==0.28.1           # used by FastAPI TestClient
+pytest>=9.0.0

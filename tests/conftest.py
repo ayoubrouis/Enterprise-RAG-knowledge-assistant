@@ -3,6 +3,8 @@
 Imported by pytest before any test module, so it must set the signing secret
 before ``app.config`` (and thus ``settings``) is first imported. The app
 refuses to start without a strong ``RAG_SECRET_KEY``.
+
+Tests use SQLite (the default) — no PostgreSQL server required.
 """
 
 from __future__ import annotations
@@ -17,3 +19,5 @@ os.environ.setdefault("RAG_QUERY_RATE_LIMIT_MAX", "1000000")
 # tests impractically slow. Lower it here; the rehash-on-login path is still
 # exercised directly by a dedicated unit test with explicit iteration counts.
 os.environ.setdefault("RAG_PBKDF2_ITERATIONS", "1000")
+# Ensure tests use SQLite, not PostgreSQL (even if the env has DATABASE_URL set).
+os.environ.pop("RAG_DATABASE_URL", None)

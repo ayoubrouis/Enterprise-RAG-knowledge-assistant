@@ -1,4 +1,4 @@
-# Default stack: API + Streamlit UI with the in-process transformers LLM.
+# Default stack: API + Streamlit UI + PostgreSQL.
 #
 # Optional inference profiles:
 #   - Ollama (CPU or GPU):  docker compose -f docker-compose.yml -f docker-compose.ollama.yml up -d
@@ -8,6 +8,23 @@
 # you want a fixed first-boot admin password).
 
 services:
+  postgres:
+    image: postgres:16-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-rag}
+      POSTGRES_USER: ${POSTGRES_USER:-rag}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rag}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-rag}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   api:
     build: .
     image: enterprise-rag/api:latest
@@ -18,12 +35,10 @@ services:
       - ./models:/app/models
       - ./backups:/app/backups
     environment:
-      # Required: the api container refuses to start without a strong secret,
-      # so an unset RAG_SECRET_KEY (missing .env) fails loudly instead of
-      # silently signing tokens with a known key.
       RAG_SECRET_KEY: ${RAG_SECRET_KEY}
       RAG_ADMIN_USERNAME: ${RAG_ADMIN_USERNAME:-admin}
       RAG_ADMIN_PASSWORD: ${RAG_ADMIN_PASSWORD:-}
+      RAG_DATABASE_URL: ${RAG_DATABASE_URL:-postgresql://rag:rag@postgres:5432/rag}
       RAG_LLM_BACKEND: ${RAG_LLM_BACKEND:-transformers}
       RAG_LLM_BASE_URL: ${RAG_LLM_BASE_URL:-http://ollama:11434}
       RAG_LLM_MODEL: ${RAG_LLM_MODEL:-google/flan-t5-base}
@@ -42,6 +57,19 @@ services:
       RAG_CORS_ORIGINS: ${RAG_CORS_ORIGINS:-}
       RAG_GLOBAL_RATE_LIMIT_MAX: ${RAG_GLOBAL_RATE_LIMIT_MAX:-120}
       RAG_TOKEN_TTL_SECONDS: ${RAG_TOKEN_TTL_SECONDS:-43200}
+      RAG_SSO_ENABLED: ${RAG_SSO_ENABLED:-}
+      RAG_SSO_PROVIDER: ${RAG_SSO_PROVIDER:-oidc}
+      RAG_SSO_DEFAULT_TENANT: ${RAG_SSO_DEFAULT_TENANT:-default}
+      RAG_OIDC_ISSUER_URL: ${RAG_OIDC_ISSUER_URL:-}
+      RAG_OIDC_CLIENT_ID: ${RAG_OIDC_CLIENT_ID:-}
+      RAG_OIDC_CLIENT_SECRET: ${RAG_OIDC_CLIENT_SECRET:-}
+      RAG_OIDC_REDIRECT_URI: ${RAG_OIDC_REDIRECT_URI:-http://localhost:8000/auth/sso/callback}
+      RAG_LDAP_SERVER_URL: ${RAG_LDAP_SERVER_URL:-ldap://ldap:389}
+      RAG_LDAP_BIND_DN: ${RAG_LDAP_BIND_DN:-}
+      RAG_LDAP_BIND_PASSWORD: ${RAG_LDAP_BIND_PASSWORD:-}
+      RAG_LDAP_USER_SEARCH_BASE: ${RAG_LDAP_USER_SEARCH_BASE:-}
+      RAG_LDAP_USER_SEARCH_FILTER: ${RAG_LDAP_USER_SEARCH_FILTER:-(uid={username})}
+      RAG_ENCRYPTION_KEY: ${RAG_ENCRYPTION_KEY:-}
     restart: unless-stopped
     read_only: true
     security_opt:
@@ -56,6 +84,9 @@ services:
       timeout: 10s
       retries: 3
       start_period: 20s
+    depends_on:
+      postgres:
+        condition: service_healthy
 
   ui:
     build: .
@@ -84,3 +115,6 @@ services:
     restart: unless-stopped
     profiles:
       - backup
+
+volumes:
+  pgdata:

@@ -249,7 +249,7 @@ def test_schema_migration_adds_superadmin_role():
         if db._CONN is not None:
             db._CONN.close()
             db._CONN = None
-        db.get_conn()
+        db._sqlite_conn()
         assert db.get_user_by_username("old")["role"] == "admin"
         db.create_user("default", "fresh", "password123", "superadmin")
         assert db.get_user_by_username("fresh")["role"] == "superadmin"
@@ -1576,3 +1576,231 @@ def test_change_password_revokes_current_token(anon_client):
     # The old token (used for the request) should now be rejected.
     resp2 = anon_client.get("/auth/me", headers={"Authorization": f"Bearer {token}"})
     assert resp2.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# v1.1 features: MFA, encryption, granular roles, new DB schema
+# ---------------------------------------------------------------------------
+
+
+def test_mfa_totp_generation_and_verification():
+    """TOTP secret generation, URI, and code verification."""
+    from app.mfa import generate_mfa_secret, get_totp_uri, verify_totp
+    import pyotp
+
+    secret = generate_mfa_secret()
+    assert len(secret) == 32  # base32 encoded
+
+    uri = get_totp_uri(secret, "testuser")
+    assert "otpauth://totp/" in uri
+    assert "testuser" in uri
+
+    # Generate a valid code and verify it
+    totp = pyotp.TOTP(secret)
+    code = totp.now()
+    assert verify_totp(secret, code) is True
+    assert verify_totp(secret, "000000") is False
+
+
+def test_mfa_enable_disable_flow(anon_client):
+    """Enable and disable MFA via the API."""
+    import app.db as db
+    from app.mfa import generate_mfa_secret
+    import pyotp
+
+    # Create a user
+    user = db.create_user("default", "mfa_test_user", "Passw0rd123!", "user")
+    from app.security import make_login_token
+    token = make_login_token(user)
+
+    # Setup MFA - should return a secret and QR
+    resp = anon_client.post(
+        "/auth/mfa/setup",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["secret"]
+    assert data["qr_code_url"].startswith("data:image/png;base64,")
+
+    # Verify with a valid TOTP code
+    totp = pyotp.TOTP(data["secret"])
+    code = totp.now()
+    resp = anon_client.post(
+        "/auth/mfa/verify",
+        json={"code": code},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["success"] is True
+
+    # Verify MFA is now enabled
+    resp = anon_client.get("/auth/me", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 200
+    assert resp.json()["mfa_enabled"] is True
+
+    # Disable MFA with a valid code
+    resp = anon_client.post(
+        "/auth/mfa/disable",
+        json={"code": totp.now()},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["success"] is True
+
+    # Verify MFA is disabled again
+    resp = anon_client.get("/auth/me", headers={"Authorization": f"Bearer {token}"})
+    assert resp.json()["mfa_enabled"] is False
+
+
+def test_mfa_verify_rejects_bad_code(client):
+    """MFA verify should reject an invalid code."""
+    import app.db as db
+    from app.security import make_login_token
+
+    user = db.create_user("default", "mfa_bad_code_user", "Passw0rd123!", "user")
+    token = make_login_token(user)
+
+    client.post("/auth/mfa/setup", headers={"Authorization": f"Bearer {token}"})
+    resp = client.post(
+        "/auth/mfa/verify",
+        json={"code": "123456"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 400
+
+
+def test_mfa_validate_exchanges_token(anon_client):
+    """MFA validate should exchange mfa_token + code for a real session."""
+    import app.db as db
+    from app.mfa import generate_mfa_secret, enable_mfa
+    import pyotp
+
+    user = db.create_user("default", "mfa_validate_user", "Passw0rd123!", "user")
+    secret = generate_mfa_secret()
+    db.set_user_mfa(user["id"], secret, enabled=True)
+
+    from app.security import make_login_token
+    mfa_token = make_login_token({**user, "token_version": user.get("token_version", 0)})
+
+    totp = pyotp.TOTP(secret)
+    resp = anon_client.post(
+        "/auth/mfa/validate",
+        json={"mfa_token": mfa_token, "code": totp.now()},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["token"]
+    assert resp.json()["username"] == "mfa_validate_user"
+
+
+def test_mfa_validate_rejects_bad_code(anon_client):
+    """MFA validate should reject an invalid code."""
+    import app.db as db
+    from app.mfa import generate_mfa_secret
+
+    user = db.create_user("default", "mfa_validate_bad", "Passw0rd123!", "user")
+    secret = generate_mfa_secret()
+    db.set_user_mfa(user["id"], secret, enabled=True)
+
+    from app.security import make_login_token
+    mfa_token = make_login_token({**user, "token_version": user.get("token_version", 0)})
+
+    resp = anon_client.post(
+        "/auth/mfa/validate",
+        json={"mfa_token": mfa_token, "code": "000000"},
+    )
+    assert resp.status_code == 401
+
+
+def test_encryption_module():
+    """Fernet encryption round-trip."""
+    from app.encryption import encrypt_bytes, decrypt_bytes, is_encryption_enabled
+    import os
+
+    # Without key, encryption is disabled (passthrough)
+    old_key = os.environ.get("RAG_ENCRYPTION_KEY", "")
+    os.environ["RAG_ENCRYPTION_KEY"] = ""
+    from importlib import reload
+    from app import config
+    reload(config)
+    assert is_encryption_enabled() is False
+    data = b"hello world"
+    assert encrypt_bytes(data) == data
+    assert decrypt_bytes(data) == data
+
+    # With key, encryption works
+    os.environ["RAG_ENCRYPTION_KEY"] = "test-encryption-key-for-unit-test-1234"
+    reload(config)
+    # Reset the Fernet cache
+    import app.encryption as enc_mod
+    enc_mod._FERNET_KEY = None
+    assert is_encryption_enabled() is True
+    original = b"Sensitive document content here"
+    encrypted = encrypt_bytes(original)
+    assert encrypted != original
+    decrypted = decrypt_bytes(encrypted)
+    assert decrypted == original
+
+    # Restore
+    os.environ["RAG_ENCRYPTION_KEY"] = old_key
+    reload(config)
+    enc_mod._FERNET_KEY = None
+
+
+def test_granular_roles_in_schema(anon_client):
+    """uploader and viewer roles should be accepted."""
+    import app.db as db
+
+    user_uploader = db.create_user("default", "uploader_test", "Passw0rd123!", "uploader")
+    assert user_uploader["role"] == "uploader"
+
+    user_viewer = db.create_user("default", "viewer_test", "Passw0rd123!", "viewer")
+    assert user_viewer["role"] == "viewer"
+
+
+def test_login_mfa_required_flow(client):
+    """Login should return mfa_required when MFA is enabled."""
+    import app.db as db
+    import pyotp
+    from app.mfa import generate_mfa_secret
+
+    user = db.create_user("default", "login_mfa_user", "Passw0rd123!", "user")
+    secret = generate_mfa_secret()
+    db.set_user_mfa(user["id"], secret, enabled=True)
+
+    resp = client.post(
+        "/auth/login",
+        json={"username": "login_mfa_user", "password": "Passw0rd123!"},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["mfa_required"] is True
+    assert data["mfa_token"] is not None
+
+
+def test_postgresql_configurable():
+    """DATABASE_URL env var should activate PostgreSQL mode."""
+    from app.config import Settings
+    import os
+
+    old = os.environ.get("RAG_DATABASE_URL", "")
+    os.environ["RAG_DATABASE_URL"] = "postgresql://user:pass@localhost:5432/test"
+    from importlib import reload
+    from app import config
+    reload(config)
+    assert config.settings.DATABASE_URL == "postgresql://user:pass@localhost:5432/test"
+    os.environ["RAG_DATABASE_URL"] = old
+    reload(config)
+
+
+def test_me_response_includes_mfa_enabled(client):
+    """GET /auth/me should include mfa_enabled field."""
+    import app.db as db
+    from app.security import make_login_token
+
+    user = db.create_user("default", "me_mfa_user", "Passw0rd123!", "user")
+    token = make_login_token(user)
+    resp = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 200
+    assert "mfa_enabled" in resp.json()
+    assert resp.json()["mfa_enabled"] is False

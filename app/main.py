@@ -64,6 +64,10 @@ from app.schemas import (
     LoginRequest,
     LoginResponse,
     MeResponse,
+    MFASetupResponse,
+    MFAValidateRequest,
+    MFAVerifyRequest,
+    MFAVerifyResponse,
     QueryLogOut,
     QueryRequest,
     QueryResponse,
@@ -80,22 +84,25 @@ from app.schemas import (
     UserUpdate,
 )
 from app.security import make_login_token, needs_rehash, verify_password_with_hash
+from app.encryption import is_encryption_enabled
+from app.mfa import enable_mfa, disable_mfa, is_mfa_enabled, get_mfa_qr, verify_totp
+from app import sso
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     setup_logging()
     db.seed_defaults()
     _register_metrics()
-    # Prune expired revocation records on startup so the table stays bounded.
     db.prune_revoked_tokens()
     yield
+    db.close()
 
 
 app = FastAPI(
     title="Enterprise RAG Knowledge Assistant",
     description="Local-first, multi-tenant retrieval-augmented generation over "
     "your documents.",
-    version="2.0.0",
+    version="2.1.0",
     lifespan=lifespan,
 )
 
@@ -586,12 +593,7 @@ def metrics_endpoint() -> Response:
 
 
 def _db_reachable() -> bool:
-    try:
-        conn = db.get_conn()
-        conn.execute("SELECT 1").fetchone()
-        return True
-    except Exception:  # noqa: BLE001 - readiness should never raise
-        return False
+    return db.is_db_reachable()
 
 
 @app.get("/auth/setup", response_model=SetupStatus)
@@ -667,10 +669,30 @@ def login(request: LoginRequest, req: Request) -> LoginResponse:
         raise HTTPException(401, "Invalid username or password")
     db.clear_login_failures(request.username)
     if needs_rehash(parsed):
-        # Stored hash predates the current PBKDF2 cost: upgrade it in place.
-        # No token-version bump here, so the token we are about to issue works.
         db.update_password_hash(user["id"], request.password)
     db.log_audit(user["tenant_id"], user["username"], user["role"], "login", f"ip={ip}")
+
+    # Check if MFA is enabled for this user
+    user_mfa_enabled = is_mfa_enabled(user["id"])
+    if user_mfa_enabled:
+        # Return a short-lived MFA token instead of a real session token
+        import secrets as _secrets
+        mfa_token = make_login_token({
+            **user,
+            "token_version": user.get("token_version", 0),
+            "_mfa_pending": True,
+        })
+        return LoginResponse(
+            token=mfa_token,
+            token_type="bearer",
+            username=user["username"],
+            role=user["role"],
+            tenant_id=user["tenant_id"],
+            tenant_name=tenant["name"],
+            mfa_required=True,
+            mfa_token=mfa_token,
+        )
+
     token = make_login_token(user)
     return LoginResponse(
         token=token,
@@ -724,20 +746,162 @@ def change_password(
 @app.get("/auth/me", response_model=MeResponse)
 def me(auth: AuthContext = Depends(get_auth_context)) -> MeResponse:
     return MeResponse(
-        username=auth.username, role=auth.role, tenant_id=auth.tenant_id, via=auth.via
+        username=auth.username,
+        role=auth.role,
+        tenant_id=auth.tenant_id,
+        via=auth.via,
+        mfa_enabled=auth.mfa_enabled,
     )
 
 
 @app.post("/auth/logout")
 def logout(auth: AuthContext = Depends(get_auth_context)) -> dict:
-    """Revoke the current session's token. The token can no longer be used
-    to authenticate until the user logs in again. Other sessions are unaffected.
-    API key callers should disable the key via admin endpoints instead."""
+    """Revoke the current session's token."""
     if auth.via != "token" or not auth.jti:
         raise HTTPException(400, "API key sessions cannot be logged out this way")
     db.revoke_token(auth.jti, auth.user_id)
     db.log_audit(auth.tenant_id, auth.username, auth.role, "logout")
     return {"status": "logged_out"}
+
+
+# ---------------------------------------------------------------------------
+# MFA endpoints
+# ---------------------------------------------------------------------------
+
+@app.post("/auth/mfa/setup", response_model=MFASetupResponse)
+def mfa_setup(
+    auth: AuthContext = Depends(get_auth_context),
+) -> MFASetupResponse:
+    """Initialize MFA: generates a TOTP secret and QR code for the user."""
+    if auth.user_id is None:
+        raise HTTPException(400, "MFA setup requires token-based authentication")
+    if is_mfa_enabled(auth.user_id):
+        raise HTTPException(409, "MFA is already enabled. Disable it first.")
+    secret = get_mfa_qr(auth.user_id)
+    if secret is None:
+        from app.mfa import generate_mfa_secret, get_totp_uri, generate_qr_data_url
+        from app.config import settings as _s
+        new_secret = generate_mfa_secret()
+        db.set_user_mfa(auth.user_id, new_secret, enabled=False)
+        uri = get_totp_uri(new_secret, auth.username)
+        qr_url = generate_qr_data_url(uri)
+        return MFASetupResponse(
+            secret=new_secret,
+            qr_code_url=qr_url,
+        )
+    return MFASetupResponse(
+        secret="",
+        qr_code_url=secret,
+    )
+
+
+@app.post("/auth/mfa/verify", response_model=MFAVerifyResponse)
+def mfa_verify(
+    body: MFAVerifyRequest,
+    auth: AuthContext = Depends(get_auth_context),
+) -> MFAVerifyResponse:
+    """Confirm a TOTP code to finish enabling MFA."""
+    if auth.user_id is None:
+        raise HTTPException(400, "MFA verification requires token-based authentication")
+    success, error = enable_mfa(auth.user_id, body.code)
+    if not success:
+        raise HTTPException(400, error)
+    db.log_audit(auth.tenant_id, auth.username, auth.role, "mfa.enable")
+    return MFAVerifyResponse(success=True, message="MFA enabled successfully.")
+
+
+@app.post("/auth/mfa/disable", response_model=MFAVerifyResponse)
+def mfa_disable(
+    body: MFAVerifyRequest,
+    auth: AuthContext = Depends(get_auth_context),
+) -> MFAVerifyResponse:
+    """Disable MFA. Requires a valid TOTP code to confirm."""
+    if auth.user_id is None:
+        raise HTTPException(400, "MFA disable requires token-based authentication")
+    success, error = disable_mfa(auth.user_id, body.code)
+    if not success:
+        raise HTTPException(400, error)
+    db.log_audit(auth.tenant_id, auth.username, auth.role, "mfa.disable")
+    return MFAVerifyResponse(success=True, message="MFA disabled successfully.")
+
+
+@app.post("/auth/mfa/validate", response_model=LoginResponse)
+def mfa_validate(
+    body: MFAValidateRequest,
+    req: Request,
+) -> LoginResponse:
+    """Exchange an MFA token + TOTP code for a real session token.
+
+    This is the second step of login when MFA is enabled.
+    """
+    try:
+        from app.security import verify_token
+        payload = verify_token(body.mfa_token)
+    except ValueError:
+        raise HTTPException(401, "Invalid or expired MFA token")
+
+    user = db.get_user_by_id(payload.get("uid"))
+    if user is None or not user["is_active"]:
+        raise HTTPException(401, "Account disabled")
+
+    if not verify_totp(user["mfa_secret"], body.code):
+        raise HTTPException(401, "Invalid MFA code")
+
+    db.log_audit(user["tenant_id"], user["username"], user["role"], "login_mfa", f"ip={req.client.host if req.client else 'unknown'}")
+    tenant = db.get_tenant(user["tenant_id"])
+    token = make_login_token(user)
+    return LoginResponse(
+        token=token,
+        token_type="bearer",
+        username=user["username"],
+        role=user["role"],
+        tenant_id=user["tenant_id"],
+        tenant_name=tenant["name"] if tenant else user["tenant_id"],
+    )
+
+
+# ---------------------------------------------------------------------------
+# SSO endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/auth/sso/login")
+def sso_login_redirect():
+    """Redirect the user to the configured SSO provider (OIDC)."""
+    if not settings.SSO_ENABLED:
+        raise HTTPException(400, "SSO is not enabled")
+    from fastapi.responses import RedirectResponse
+    url = sso.oidc_authorization_url()
+    return RedirectResponse(url)
+
+
+@app.get("/auth/sso/callback")
+def sso_callback(code: str = "", state: str = "") -> LoginResponse:
+    """Handle the OIDC callback: exchange code for tokens, provision user, issue session."""
+    if not settings.SSO_ENABLED:
+        raise HTTPException(400, "SSO is not enabled")
+    if not code:
+        raise HTTPException(400, "Missing authorization code")
+
+    try:
+        claims = sso.sso_authenticate(code=code)
+    except Exception as exc:
+        raise HTTPException(401, f"SSO authentication failed: {exc}")
+
+    if claims is None:
+        raise HTTPException(401, "SSO authentication failed")
+
+    user = sso.provision_sso_user(claims)
+    tenant = db.get_tenant(user["tenant_id"])
+    token = make_login_token(user)
+    db.log_audit(user["tenant_id"], user["username"], user["role"], "login_sso")
+    return LoginResponse(
+        token=token,
+        token_type="bearer",
+        username=user["username"],
+        role=user["role"],
+        tenant_id=user["tenant_id"],
+        tenant_name=tenant["name"] if tenant else user["tenant_id"],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -783,8 +947,9 @@ def list_documents(auth: AuthContext = Depends(get_auth_context)) -> list[Docume
     docs_dir = settings.tenant_docs_dir(auth.tenant_id)
     if not docs_dir.exists():
         return []
+    enc = is_encryption_enabled()
     return [
-        DocumentInfo(filename=p.name, size=p.stat().st_size)
+        DocumentInfo(filename=p.name, size=p.stat().st_size, encrypted=enc)
         for p in sorted(docs_dir.iterdir())
         if p.is_file()
     ]
@@ -819,8 +984,18 @@ def upload_document(
         with dest.open("wb") as out:
             written = _copy_upload_limited(file.file, out, max_bytes)
     except HTTPException:
-        dest.unlink(missing_ok=True)  # never leave a partial file behind
+        dest.unlink(missing_ok=True)
         raise
+
+    # Encrypt at rest if configured
+    if is_encryption_enabled():
+        from app.encryption import encrypt_file
+        import tempfile
+        tmp = dest.with_suffix(dest.suffix + ".tmp")
+        dest.rename(tmp)
+        encrypt_file(tmp, dest)
+        tmp.unlink(missing_ok=True)
+
     db.log_audit(
         auth.tenant_id,
         auth.username,
@@ -886,6 +1061,14 @@ def _copy_upload_limited(src, dst, max_bytes: int) -> int:
 # ---------------------------------------------------------------------------
 # Admin endpoints (role=admin)
 # ---------------------------------------------------------------------------
+
+def _normalize_user(u: dict) -> UserOut:
+    """Convert DB row to UserOut, normalizing mfa_enabled to bool."""
+    mfa = u.get("mfa_enabled", False)
+    if isinstance(mfa, int):
+        mfa = bool(mfa)
+    return UserOut(**{**u, "mfa_enabled": mfa})
+
 
 def _tenant_out(t: dict) -> TenantOut:
     return TenantOut(
@@ -985,7 +1168,7 @@ def admin_list_users(
     ensure_tenant_access(auth, tenant_id)
     if not db.get_tenant(tenant_id):
         raise HTTPException(404, "Tenant not found")
-    return [UserOut(**u) for u in db.list_users(tenant_id)]
+    return [_normalize_user(u) for u in db.list_users(tenant_id)]
 
 
 @app.patch("/admin/tenants/{tenant_id}/users/{username}", response_model=UserOut)
@@ -1010,7 +1193,7 @@ def admin_update_user(
         "user.update",
         f"username='{username}' is_active={body.is_active}",
     )
-    return UserOut(**db.get_user_by_id(user["id"]))
+    return _normalize_user(db.get_user_by_id(user["id"]))
 
 
 @app.post("/admin/tenants/{tenant_id}/api-keys", response_model=ApiKeyCreated)

@@ -14,6 +14,15 @@ free, open-source models. Designed to be sold/installed **on-prem per enterprise
 
 - **Multi-tenant** — every tenant is fully isolated on disk
   (`data/tenants/<tenant_id>/docs/` + `vectorstore/`); retrieval can never cross tenants.
+- **PostgreSQL + SQLite** — use PostgreSQL in production (`RAG_DATABASE_URL`); SQLite
+  for development and tests (zero setup). All features work identically on both backends.
+- **SSO / OIDC / LDAP** — authenticate via external identity providers. OAuth2/OIDC
+  (discovery, authorization code flow) or LDAP (bind/search/authenticate). Users are
+  auto-provisioned on first SSO login.
+- **Multi-Factor Authentication** — TOTP-based MFA via `pyotp`. Users enable MFA
+  through a QR code flow; login adds a second step when MFA is active.
+- **At-rest encryption** — uploaded documents can be encrypted with Fernet (AES-128-CBC +
+  HMAC-SHA256) via `RAG_ENCRYPTION_KEY`. Transparent: reading decrypts automatically.
 - **Authentication** — JWT-style login tokens + per-tenant API keys. Passwords hashed
   with PBKDF2-HMAC-SHA256 at 600k iterations (stdlib only, no paid deps); old weak hashes
   are transparently rehashed on the next successful login. Login is brute-force protected:
@@ -25,6 +34,8 @@ free, open-source models. Designed to be sold/installed **on-prem per enterprise
 - **Two admin tiers, no conflicts** — a *platform admin* (superadmin) runs the whole app
   (creates tenants, sees all logs); *enterprise admins* manage **only their own tenant**
   (users + API keys). Employees are tenant-scoped. No one can touch another enterprise.
+- **Granular roles** — `superadmin`, `admin`, `user`, `uploader`, and `viewer` roles
+  provide fine-grained access control for different user types.
 - **Document upload** — upload documents through the UI or API; the tenant index rebuilds
   asynchronously (a background job, pollable via `/ingest/status`). Uploads are capped
   (`RAG_MAX_UPLOAD_MB`, default 50 MiB) and oversized files return 413 with no partial
@@ -45,6 +56,8 @@ free, open-source models. Designed to be sold/installed **on-prem per enterprise
   non-root Docker container with read-only filesystem, global per-IP rate limiting (with
   `X-RateLimit-*` headers on every response), and per-caller rate limiting on the expensive
   `/query` endpoint.
+- **CI/CD** — GitHub Actions workflow: ruff lint + pytest + Docker build on push to
+  `main`/`v1.1` and pull requests. Python 3.11/3.12 matrix.
 - **Three LLM backends** — in-process transformers (default, any CPU), Ollama (CPU/GPU),
   or vLLM (NVIDIA GPU). Swap via one environment variable.
 - **REST API** — FastAPI with interactive Swagger docs at `/docs`.
@@ -54,7 +67,7 @@ free, open-source models. Designed to be sold/installed **on-prem per enterprise
   (plus the same via REST API or `scripts/manage.py`).
 - **Evaluation** — retrieval `precision@k`, `recall@k`, and `MRR` on a labeled set.
 - **Docker** — CPU default + optional Ollama/vLLM profiles; `data/` and `models/` are
-  volumes, so updates never touch customer data.
+  volumes, so updates never touch customer data. Optional PostgreSQL service.
 
 ---
 
@@ -63,10 +76,13 @@ free, open-source models. Designed to be sold/installed **on-prem per enterprise
 ```
 ├── app/
 │   ├── config.py            # every tunable setting in one place
-│   ├── main.py              # FastAPI backend (multi-tenant, auth, admin)
+│   ├── main.py              # FastAPI backend (multi-tenant, auth, admin, MFA, SSO, encryption)
 │   ├── security.py          # PBKDF2 hashing, signed tokens, API keys (stdlib)
-│   ├── db.py                # SQLite: tenants, users, keys, query + audit logs (stdlib)
+│   ├── db.py                # PostgreSQL + SQLite: tenants, users, keys, query + audit logs
 │   ├── auth.py              # FastAPI auth dependency -> tenant context
+│   ├── mfa.py               # TOTP-based multi-factor authentication (pyotp + qrcode)
+│   ├── sso.py               # OAuth2/OIDC + LDAP single sign-on
+│   ├── encryption.py        # At-rest Fernet encryption for uploaded documents
 │   ├── metrics.py           # Prometheus counters/gauges/histograms (stdlib)
 │   ├── logging_utils.py     # JSON structured logs + request-id correlation
 │   ├── schemas.py           # API request/response models
@@ -91,6 +107,7 @@ free, open-source models. Designed to be sold/installed **on-prem per enterprise
 │   ├── update.sh/.ps1       # on-prem update scripts
 │   └── download_model.py    # resumable model downloader
 ├── tests/                   # no-network unit + API tests
+├── .github/workflows/ci.yml # CI/CD: lint + test + Docker build
 ├── monitoring/
 │   ├── grafana-dashboard.json  # ready-to-import Grafana dashboard
 │   └── alert-rules.yml         # Prometheus alerting rules (5 alerts)
@@ -193,6 +210,8 @@ index rebuilds automatically. Or drop files into `data/tenants/default/docs/` an
 | **Platform admin** (`superadmin`) | `RAG_ADMIN_PASSWORD` seed or CLI (`manage.py ensure --superadmin`) | whole app | create/disable tenants, manage any tenant's users/keys, see all logs, create other platform admins |
 | **Enterprise admin** (`admin`) | setup wizard (first account) or any admin | its own tenant only | add/disable its employees, create its API keys, manage its documents, see its own query log |
 | **Employee** (`user`) | any admin | its own tenant only | ask questions, upload/manage its tenant's documents |
+| **Uploader** (`uploader`) | any admin | its own tenant only | upload documents for its tenant |
+| **Viewer** (`viewer`) | any admin | its own tenant only | ask questions (read-only, no uploads) |
 | **API integration** (`via=api-key`) | any admin (per tenant) | its own tenant only | query + upload for that tenant |
 
 Enterprise admins can never see, modify, or disable **another** enterprise. Only the
@@ -214,10 +233,16 @@ from the credentials, never from the request body.
 | GET      | `/`                                      | none  | Service info                                  |
 | GET      | `/auth/setup`                            | none  | `{"needed": bool}` first-run setup status     |
 | POST     | `/auth/setup`                            | none  | One-time first-run wizard (`tenant_name`,`username`,`password`) -> token; 409 if already set up |
-| POST     | `/auth/login`                            | none  | `{"username","password"}` -> token            |
+| POST     | `/auth/login`                            | none  | `{"username","password"}` -> token (may return `mfa_required` + `mfa_token`) |
 | POST     | `/auth/change-password`                  | user  | `{"old_password","new_password"}` -> new token; revokes all other sessions |
 | POST     | `/auth/logout`                           | user  | Revoke current session's token (other sessions unaffected) |
-| GET      | `/auth/me`                               | user  | Current user + tenant                         |
+| GET      | `/auth/me`                               | user  | Current user + tenant + `mfa_enabled` status                     |
+| POST     | `/auth/mfa/setup`                        | user  | Initialize MFA: returns TOTP secret + QR code                    |
+| POST     | `/auth/mfa/verify`                       | user  | `{"code"}` -> confirm TOTP code, enables MFA                    |
+| POST     | `/auth/mfa/disable`                      | user  | `{"code"}` -> disable MFA (requires valid TOTP code)            |
+| POST     | `/auth/mfa/validate`                     | none  | `{"mfa_token","code"}` -> session token (second step of MFA login) |
+| GET      | `/auth/sso/login`                        | none  | Redirect to SSO provider's authorization URL                    |
+| GET      | `/auth/sso/callback`                     | none  | SSO callback: exchange code for token, auto-provision user      |
 | GET      | `/stats`                                 | user  | Tenant docs/chunks indexed                    |
 | POST     | `/query`                                 | user  | `{"question","top_k"}` -> answer + sources (+ `grounded`) |
 | GET      | `/documents`                             | user  | Files stored for this tenant                  |
@@ -360,7 +385,9 @@ Tests need no network and no model downloads (the API tests inject a fake pipeli
 use a throwaway SQLite file). The suite covers auth, tenant/admin scoping, token
 revocation on password change, API-key disable/revoke, the audit log, grounding checks,
 upload caps, background ingest jobs, metrics/readiness, brute-force protection, CORS,
-Docker hardening, TLS overlay, backup/restore, and regression tests for audit fixes.
+Docker hardening, TLS overlay, backup/restore, regression tests for audit fixes, MFA
+enable/disable/validate, TOTP verification, at-rest encryption round-trip, SSO
+configuration, PostgreSQL config detection, granular role acceptance, and login MFA flow.
 
 ---
 
@@ -373,5 +400,9 @@ Docker hardening, TLS overlay, backup/restore, and regression tests for audit fi
 | Vector store   | faiss-cpu |
 | Document I/O   | pypdf, docx2txt, reportlab (demo PDFs) |
 | Backend / UI   | fastapi, uvicorn, streamlit, pandas |
+| Database       | psycopg2-binary (PostgreSQL), sqlite3 (stdlib) |
+| SSO / OIDC     | httpx (OIDC discovery + token exchange) |
+| MFA            | pyotp (TOTP), qrcode (QR generation) |
+| Encryption     | cryptography (Fernet) |
 | Auth / storage | Python standard library only (hashlib, hmac, secrets, sqlite3) |
 | Testing        | pytest, httpx |
