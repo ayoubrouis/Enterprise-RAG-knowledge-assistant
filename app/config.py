@@ -107,7 +107,7 @@ class Settings:
     # to fall back to a fixed dev key - never do this in production.
     SECRET_KEY: str = os.environ.get("RAG_SECRET_KEY", "").strip()
     ALLOW_INSECURE_DEV_KEY: bool = os.environ.get("RAG_ALLOW_INSECURE_DEV_KEY", "") == "1"
-    TOKEN_TTL_SECONDS: int = 12 * 3600
+    TOKEN_TTL_SECONDS: int = int(os.environ.get("RAG_TOKEN_TTL_SECONDS", str(12 * 3600)))
     ADMIN_USERNAME: str = os.environ.get("RAG_ADMIN_USERNAME", "admin")
     # Leave empty for the first-run setup wizard (interactive installs): the UI
     # shows a one-time "create your enterprise + admin" page, and afterwards it

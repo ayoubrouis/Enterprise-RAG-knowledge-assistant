@@ -41,6 +41,7 @@ services:
       RAG_LOGIN_FAILURE_WINDOW_SECONDS: ${RAG_LOGIN_FAILURE_WINDOW_SECONDS:-900}
       RAG_CORS_ORIGINS: ${RAG_CORS_ORIGINS:-}
       RAG_GLOBAL_RATE_LIMIT_MAX: ${RAG_GLOBAL_RATE_LIMIT_MAX:-120}
+      RAG_TOKEN_TTL_SECONDS: ${RAG_TOKEN_TTL_SECONDS:-43200}
     restart: unless-stopped
     read_only: true
     security_opt:
@@ -68,3 +69,18 @@ services:
     depends_on:
       - api
     restart: unless-stopped
+
+  backup:
+    image: alpine:3.19
+    command: ["/bin/bash", "/scripts/cron-entrypoint.sh"]
+    volumes:
+      - ./data:/app/data
+      - ./backups:/app/backups
+      - ./scripts:/scripts:ro
+    environment:
+      RAG_DATA_DIR: /app/data
+      BACKUP_DIR: /app/backups
+      BACKUP_CRON: ${BACKUP_CRON:-0 2 * * *}
+    restart: unless-stopped
+    profiles:
+      - backup

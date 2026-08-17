@@ -89,6 +89,7 @@ Set at minimum:
 | `RAG_LOGIN_FAILURE_WINDOW_SECONDS` | Optional: brute-force rolling window length in seconds (default 900 = 15 min). |
 | `RAG_CORS_ORIGINS` | Optional: comma-separated list of allowed CORS origins. Leave empty for all origins (dev). In production set to your frontend origin(s), e.g. `https://rag.example.com`. |
 | `RAG_GLOBAL_RATE_LIMIT_MAX` | Optional: per-IP sliding-window cap on ALL requests (default 120/min). Protects against DoS. |
+| `RAG_TOKEN_TTL_SECONDS` | Optional: login token time-to-live in seconds (default 43200 = 12h). Tokens expire automatically; use change-password or logout to revoke early. |
 
 Generate a secret key:
 
@@ -247,6 +248,22 @@ bash scripts/restore.sh ./backups/<ts>    # restore (refuses to overwrite withou
 bash scripts/restore.sh ./backups/<ts> --force  # overwrite existing data
 ```
 
+### Automated backups (cron sidecar)
+
+Enable the backup sidecar to run daily at 2 AM (configurable via `BACKUP_CRON`):
+
+```bash
+docker compose --profile backup up -d backup
+```
+
+The sidecar uses Alpine + busybox cron and calls `scripts/backup.sh` on schedule.
+Snapshots are written to `./backups/` on the host. Adjust the schedule:
+
+```bash
+# Every 6 hours
+BACKUP_CRON="0 */6 * * *" docker compose --profile backup up -d backup
+```
+
 ### Manual alternative
 
 ```bash
@@ -292,7 +309,8 @@ For a registry-based rollout (recommended at scale):
 - **Metrics**: `GET /metrics` exposes Prometheus counters/gauges/histograms
   (`rag_http_requests_total`, `rag_query_latency_seconds`, `rag_index_documents`,
   `rag_active_ingest_jobs`, `rag_pipeline_cache_size`, ...) — point a Prometheus/Grafana
-  scrape at it for dashboards and alerting.
+  scrape at it for dashboards and alerting. A ready-to-import Grafana dashboard is at
+  `monitoring/grafana-dashboard.json` (import via Grafana UI → Dashboards → Import).
 - **Structured logs**: JSON-lines output with a `request_id` per request (echoed back in
   the `X-Request-ID` response header) so UI/API requests can be correlated across the
   stack: `docker compose logs -f api | jq -r '.request_id, .msg'`.

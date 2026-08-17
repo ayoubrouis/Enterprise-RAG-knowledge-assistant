@@ -1392,3 +1392,35 @@ def test_security_headers_on_auth_endpoint(client, monkeypatch):
     # Even a 401 response should carry security headers.
     assert resp.headers["X-Content-Type-Options"] == "nosniff"
     assert resp.headers["X-Frame-Options"] == "DENY"
+
+
+# ---------------------------------------------------------------------------
+# Tier 3: Configurable token TTL
+# ---------------------------------------------------------------------------
+
+
+def test_token_ttl_is_env_configurable(monkeypatch):
+    """RAG_TOKEN_TTL_SECONDS is wired into the token's exp claim."""
+    from app.security import sign_token, verify_token
+
+    monkeypatch.setattr(settings, "TOKEN_TTL_SECONDS", 300)
+    token = sign_token({"uid": 1})
+    payload = verify_token(token)
+    # exp should be ~300s from now, not the default 43200.
+    assert payload["exp"] - int(__import__("time").time()) <= 305
+
+
+# ---------------------------------------------------------------------------
+# Tier 3: Grafana dashboard exists and is valid JSON
+# ---------------------------------------------------------------------------
+
+
+def test_grafana_dashboard_is_valid_json():
+    import json
+    from pathlib import Path
+
+    dash_path = Path(__file__).resolve().parent.parent / "monitoring" / "grafana-dashboard.json"
+    assert dash_path.exists(), "grafana-dashboard.json not found"
+    data = json.loads(dash_path.read_text(encoding="utf-8"))
+    assert data["uid"] == "enterprise-rag"
+    assert len(data["panels"]) >= 8

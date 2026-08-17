@@ -85,10 +85,13 @@ free, open-source models. Designed to be sold/installed **on-prem per enterprise
 │   ├── manage.py            # admin CLI (tenants, users, API keys)
 │   ├── backup.sh            # snapshot DB + tenant data
 │   ├── restore.sh           # restore from a snapshot
+│   ├── cron-entrypoint.sh   # backup cron sidecar entrypoint
 │   ├── migrate_legacy_data.py  # moves pre-v2 data into the tenant layout
 │   ├── update.sh/.ps1       # on-prem update scripts
 │   └── download_model.py    # resumable model downloader
 ├── tests/                   # no-network unit + API tests
+├── monitoring/
+│   └── grafana-dashboard.json  # ready-to-import Grafana dashboard
 ├── data/
 │   ├── tenants/<id>/docs/   # each tenant's source documents
 │   ├── tenants/<id>/vectorstore/  # each tenant's FAISS index
