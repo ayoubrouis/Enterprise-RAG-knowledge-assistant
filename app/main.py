@@ -99,11 +99,40 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.CORS_ORIGINS.split(",") if settings.CORS_ORIGINS else ["*"],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def _security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    if request.url.scheme == "https":
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    return response
+
+
+@app.middleware("http")
+async def _global_rate_limit(request: Request, call_next):
+    """Per-IP sliding-window rate limit on all endpoints."""
+    # Skip rate limiting for health checks and metrics.
+    if request.url.path in ("/health", "/health/ready", "/metrics"):
+        return await call_next(request)
+    ip = request.client.host if request.client else "unknown"
+    if _global_rate_limiter.allow(ip):
+        return await call_next(request)
+    retry = int(_global_rate_limiter.retry_after(ip)) + 1
+    return Response(
+        content='{"detail":"Rate limit exceeded. Try again later."}',
+        status_code=429,
+        media_type="application/json",
+        headers={"Retry-After": str(retry), "X-Request-ID": request_id_var.get("")},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -313,6 +342,13 @@ def enforce_query_rate_limit(auth: AuthContext) -> None:
         detail=f"Rate limit exceeded. Retry in {retry}s.",
         headers={"Retry-After": str(retry)},
     )
+
+
+# Global per-IP rate limiter (protects all endpoints, including unauthenticated).
+_global_rate_limiter = _SlidingWindowRateLimiter(
+    max_requests=settings.GLOBAL_RATE_LIMIT_MAX,
+    window_seconds=settings.GLOBAL_RATE_LIMIT_WINDOW_SECONDS,
+)
 
 
 def get_pipeline(tenant_id: str) -> RAGPipeline:
@@ -643,6 +679,18 @@ def me(auth: AuthContext = Depends(get_auth_context)) -> MeResponse:
     return MeResponse(
         username=auth.username, role=auth.role, tenant_id=auth.tenant_id, via=auth.via
     )
+
+
+@app.post("/auth/logout")
+def logout(auth: AuthContext = Depends(get_auth_context)) -> dict:
+    """Revoke the current session's token. The token can no longer be used
+    to authenticate until the user logs in again. Other sessions are unaffected.
+    API key callers should disable the key via admin endpoints instead."""
+    if auth.via != "token" or not auth.jti:
+        raise HTTPException(400, "API key sessions cannot be logged out this way")
+    db.revoke_token(auth.jti, auth.user_id)
+    db.log_audit(auth.tenant_id, auth.username, auth.role, "logout")
+    return {"status": "logged_out"}
 
 
 # ---------------------------------------------------------------------------

@@ -31,6 +31,12 @@ COPY scripts ./scripts
 # never touch customer documents or weights.
 VOLUME ["/app/data", "/app/models"]
 
+# Non-root user for least-privilege runtime.
+RUN groupadd -r appgroup && useradd -r -g appgroup -d /app -s /sbin/nologin appuser \
+ && chown -R appuser:appgroup /app
+
+USER appuser
+
 EXPOSE 8000 8501
 
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

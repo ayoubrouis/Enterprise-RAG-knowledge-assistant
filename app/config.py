@@ -148,6 +148,12 @@ class Settings:
     # Where the Streamlit UI (a separate process) reaches the FastAPI backend.
     API_BASE_URL: str = os.environ.get("RAG_API_BASE_URL", "http://127.0.0.1:8000")
 
+    # ---- CORS -----------------------------------------------------------
+    # Comma-separated list of allowed origins for cross-origin requests.
+    # In production, set this to your frontend origin(s) only. The Streamlit
+    # UI runs on the same host by default.
+    CORS_ORIGINS: str = os.environ.get("RAG_CORS_ORIGINS", "")
+
     # ---- Brute-force protection ---------------------------------------
     # Login failures are recorded per (username, ip) and enforced inside a
     # rolling window. Exceeding the per-username limit locks that account;
@@ -162,6 +168,14 @@ class Settings:
     QUERY_RATE_LIMIT_MAX: int = int(os.environ.get("RAG_QUERY_RATE_LIMIT_MAX", "30"))
     QUERY_RATE_LIMIT_WINDOW_SECONDS: int = int(
         os.environ.get("RAG_QUERY_RATE_LIMIT_WINDOW_SECONDS", "60")
+    )
+
+    # ---- Global rate limiting -------------------------------------------
+    # Per-IP sliding-window cap on ALL requests. Protects against DoS from
+    # unauthenticated or low-privilege callers.
+    GLOBAL_RATE_LIMIT_MAX: int = int(os.environ.get("RAG_GLOBAL_RATE_LIMIT_MAX", "120"))
+    GLOBAL_RATE_LIMIT_WINDOW_SECONDS: int = int(
+        os.environ.get("RAG_GLOBAL_RATE_LIMIT_WINDOW_SECONDS", "60")
     )
 
     # ---- Document chunking strategy -------------------------------------

@@ -102,6 +102,7 @@ def make_login_token(user: dict) -> str:
             "tid": user["tenant_id"],
             "role": user["role"],
             "tv": user.get("token_version", 0),
+            "jti": secrets.token_urlsafe(16),
         }
     )
 

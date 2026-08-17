@@ -87,6 +87,8 @@ Set at minimum:
 | `RAG_LOGIN_MAX_FAILURES` | Optional: per-username lockout threshold within the rolling window (default 5). |
 | `RAG_LOGIN_MAX_FAILURES_PER_IP` | Optional: per-source-IP throttle threshold within the rolling window (default 20). |
 | `RAG_LOGIN_FAILURE_WINDOW_SECONDS` | Optional: brute-force rolling window length in seconds (default 900 = 15 min). |
+| `RAG_CORS_ORIGINS` | Optional: comma-separated list of allowed CORS origins. Leave empty for all origins (dev). In production set to your frontend origin(s), e.g. `https://rag.example.com`. |
+| `RAG_GLOBAL_RATE_LIMIT_MAX` | Optional: per-IP sliding-window cap on ALL requests (default 120/min). Protects against DoS. |
 
 Generate a secret key:
 
@@ -235,6 +237,16 @@ python scripts/manage.py restore --from /mnt/backups/backup_20260809_191030 --fo
 Restore refuses to overwrite existing data unless `--force` is given. Both commands
 honor `RAG_DATA_DIR` / `RAG_DB_PATH`, so you can restore into a relocated data folder.
 
+### Shell scripts (alternative)
+
+Standalone scripts that can be cron'd or called from any automation:
+
+```bash
+bash scripts/backup.sh ./backups          # snapshot to ./backups/<timestamp>/
+bash scripts/restore.sh ./backups/<ts>    # restore (refuses to overwrite without --force)
+bash scripts/restore.sh ./backups/<ts> --force  # overwrite existing data
+```
+
 ### Manual alternative
 
 ```bash
@@ -314,6 +326,9 @@ Common issues:
 - Changing a password **revokes every other session instantly** (each login token is bound
   to the user's token version). Users rotate their own password in the UI sidebar or via
   `POST /auth/change-password`; the response carries a fresh token for the current session.
+- Individual sessions can be **revoked via logout** (`POST /auth/logout`) without affecting
+  other sessions. Each token carries a unique `jti` (token id); logout stores it in a
+  revocation list checked on every request.
 - API keys can be **disabled** (temporarily, `PATCH`) or **revoked** (permanently,
   `DELETE`) from the admin UI/API/CLI. Rotate credentials by disabling the old key and
   issuing a new one — the old key stops authenticating immediately.
@@ -331,6 +346,13 @@ Common issues:
   `403 Not your tenant` when an admin targets a tenant that isn't theirs.
 - Put the stack behind a reverse proxy with TLS if exposed beyond the LAN (Caddy/Nginx,
   free). Bind the UI/API to the LAN or VPN, not the public internet.
+- The Docker container runs as a **non-root user** with `read_only` filesystem,
+  `cap_drop: ALL`, and `no-new-privileges`. Only `/tmp` is writable (tmpfs).
+- **Security headers** are set on every response: `X-Content-Type-Options: nosniff`,
+  `X-Frame-Options: DENY`, `Referrer-Policy: strict-origin-when-cross-origin`, and
+  `Strict-Transport-Security` (when served over HTTPS).
+- **CORS** is configurable via `RAG_CORS_ORIGINS`. Defaults to `*` for development;
+  set an explicit allowlist in production.
 - The auth DB stores only PBKDF2 password hashes and SHA-256 API key hashes — no
   plaintext credentials.
 - Tenants are isolated on disk; enabling multi-tenancy on one box keeps each tenant's

@@ -19,6 +19,13 @@ from app.security import hash_api_key, verify_token
 _bearer = HTTPBearer(auto_error=False)
 
 
+def _check_token_revocation(payload: dict) -> None:
+    """Reject tokens whose jti has been revoked (e.g. after logout)."""
+    jti = payload.get("jti")
+    if jti and db.is_token_revoked(jti):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Token revoked")
+
+
 @dataclass
 class AuthContext:
     tenant_id: str
@@ -27,6 +34,7 @@ class AuthContext:
     subject: str            # stable unique principal id (for rate limiting etc.)
     user_id: int | None = None
     via: str = "token"
+    jti: str | None = None  # token id for per-session revocation
 
 
 def get_auth_context(
@@ -67,6 +75,7 @@ def get_auth_context(
     # still validate against a user who has never changed their password.
     if int(payload.get("tv", 0)) != int(user.get("token_version", 0)):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Session revoked")
+    _check_token_revocation(payload)
     tenant = db.get_tenant(user["tenant_id"])
     if tenant is None or not tenant["is_active"]:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Tenant disabled")
@@ -77,6 +86,7 @@ def get_auth_context(
         subject=f"user:{user['id']}",
         user_id=user["id"],
         via="token",
+        jti=payload.get("jti"),
     )
 
 

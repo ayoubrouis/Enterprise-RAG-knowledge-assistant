@@ -111,6 +111,13 @@ def _init_schema() -> None:
                 ON audit_logs(tenant_id, created_at);
             CREATE INDEX IF NOT EXISTS idx_audit_actor_time
                 ON audit_logs(actor, created_at);
+            CREATE TABLE IF NOT EXISTS revoked_tokens (
+                jti        TEXT PRIMARY KEY,
+                user_id    INTEGER,
+                revoked_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_revoked_tokens_user
+                ON revoked_tokens(user_id, revoked_at);
             """
         )
         _migrate_role_column(conn)
@@ -524,3 +531,31 @@ def list_audit_logs(tenant_id: str | None = None, limit: int = 100) -> list[dict
                 "SELECT * FROM audit_logs ORDER BY id DESC LIMIT ?", (limit,)
             ).fetchall()
     return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Token revocation (per-token logout)
+# ---------------------------------------------------------------------------
+
+def revoke_token(jti: str, user_id: int) -> None:
+    """Record a revoked token so it can no longer be used."""
+    with tx() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO revoked_tokens (jti, user_id, revoked_at) VALUES (?, ?, ?)",
+            (jti, user_id, time.time()),
+        )
+
+
+def is_token_revoked(jti: str) -> bool:
+    with tx() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM revoked_tokens WHERE jti = ?", (jti,)
+        ).fetchone()
+    return row is not None
+
+
+def prune_revoked_tokens() -> None:
+    """Remove revocation records for tokens that have already expired."""
+    cutoff = time.time() - settings.TOKEN_TTL_SECONDS
+    with tx() as conn:
+        conn.execute("DELETE FROM revoked_tokens WHERE revoked_at < ?", (cutoff,))

@@ -20,6 +20,7 @@ free, open-source models. Designed to be sold/installed **on-prem per enterprise
   accounts are locked after repeated failures and source IPs are throttled (rolling window).
 - **Password rotation & session revocation** — users can change their own password
   (UI or `POST /auth/change-password`); the change instantly revokes every other session.
+  Individual sessions can be revoked via `POST /auth/logout` without affecting others.
   API keys can be *disabled* (temporarily) or *revoked* (permanently) by an admin.
 - **Two admin tiers, no conflicts** — a *platform admin* (superadmin) runs the whole app
   (creates tenants, sees all logs); *enterprise admins* manage **only their own tenant**
@@ -40,6 +41,9 @@ free, open-source models. Designed to be sold/installed **on-prem per enterprise
 - **Observability** — JSON structured logs with `X-Request-ID` correlation across
   UI/API requests, Prometheus metrics at `/metrics`, and a `/health/ready` readiness probe
   used by the Docker healthcheck.
+- **Security hardening** — configurable CORS, security headers (HSTS, nosniff, DENY frame),
+  non-root Docker container with read-only filesystem, global per-IP rate limiting, and
+  per-caller rate limiting on the expensive `/query` endpoint.
 - **Three LLM backends** — in-process transformers (default, any CPU), Ollama (CPU/GPU),
   or vLLM (NVIDIA GPU). Swap via one environment variable.
 - **REST API** — FastAPI with interactive Swagger docs at `/docs`.
@@ -79,6 +83,8 @@ free, open-source models. Designed to be sold/installed **on-prem per enterprise
 │   ├── ingest.py            # builds a tenant's vector index (CLI)
 │   ├── run_eval.py          # runs retrieval evaluation
 │   ├── manage.py            # admin CLI (tenants, users, API keys)
+│   ├── backup.sh            # snapshot DB + tenant data
+│   ├── restore.sh           # restore from a snapshot
 │   ├── migrate_legacy_data.py  # moves pre-v2 data into the tenant layout
 │   ├── update.sh/.ps1       # on-prem update scripts
 │   └── download_model.py    # resumable model downloader
@@ -205,6 +211,7 @@ from the credentials, never from the request body.
 | POST     | `/auth/setup`                            | none  | One-time first-run wizard (`tenant_name`,`username`,`password`) -> token; 409 if already set up |
 | POST     | `/auth/login`                            | none  | `{"username","password"}` -> token            |
 | POST     | `/auth/change-password`                  | user  | `{"old_password","new_password"}` -> new token; revokes all other sessions |
+| POST     | `/auth/logout`                           | user  | Revoke current session's token (other sessions unaffected) |
 | GET      | `/auth/me`                               | user  | Current user + tenant                         |
 | GET      | `/stats`                                 | user  | Tenant docs/chunks indexed                    |
 | POST     | `/query`                                 | user  | `{"question","top_k"}` -> answer + sources (+ `grounded`) |

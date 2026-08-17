@@ -1214,3 +1214,181 @@ def test_manage_restore_force_overwrites_existing_data(monkeypatch, tmp_path):
     cmd_restore(RestoreArgs())
     assert not (dst / "tenants" / "acme" / "docs" / "stale.txt").exists()
     assert (dst / "tenants" / "acme" / "docs" / "a.txt").read_text(encoding="utf-8") == "hello"
+
+
+# ---------------------------------------------------------------------------
+# Tier 2: Security headers
+# ---------------------------------------------------------------------------
+
+
+def test_security_headers_present(client):
+    resp = client.get("/health")
+    assert resp.headers["X-Content-Type-Options"] == "nosniff"
+    assert resp.headers["X-Frame-Options"] == "DENY"
+    assert resp.headers["Referrer-Policy"] == "strict-origin-when-cross-origin"
+
+
+def test_hsts_header_on_https(client):
+    """HSTS is only sent when the request comes over HTTPS."""
+    resp = client.get("/health", headers={"X-Forwarded-Proto": "https"})
+    # TestClient doesn't honor X-Forwarded-Proto for scheme detection, but
+    # the middleware checks request.url.scheme. In test, scheme is http, so
+    # HSTS should NOT be present.
+    assert "Strict-Transport-Security" not in resp.headers
+
+
+# ---------------------------------------------------------------------------
+# Tier 2: Token revocation (jti + /auth/logout)
+# ---------------------------------------------------------------------------
+
+
+def test_token_contains_jti(client):
+    from app.security import make_login_token, verify_token
+    import app.db as db
+
+    # Seed a user so we can create a real token.
+    user = db.create_user("default", "jti_test_user", "Passw0rd123!", "user")
+    token = make_login_token(user)
+    payload = verify_token(token)
+    assert "jti" in payload
+    assert isinstance(payload["jti"], str)
+    assert len(payload["jti"]) > 8
+
+
+def test_logout_revokes_token(anon_client):
+    """Login, then logout, then try to use the revoked token."""
+    import app.db as db
+
+    # Seed user + login to get a real token.
+    db.create_user("default", "logout_user", "Passw0rd123!", "user")
+    login_resp = anon_client.post(
+        "/auth/login", json={"username": "logout_user", "password": "Passw0rd123!"}
+    )
+    assert login_resp.status_code == 200
+    token = login_resp.json()["token"]
+
+    # Logout.
+    resp = anon_client.post(
+        "/auth/logout", headers={"Authorization": f"Bearer {token}"}
+    )
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "logged_out"
+
+    # The same token should now be rejected.
+    resp2 = anon_client.get("/auth/me", headers={"Authorization": f"Bearer {token}"})
+    assert resp2.status_code == 401
+    assert "revoked" in resp2.json()["detail"].lower()
+
+
+def test_logout_twice_same_token_returns_401(anon_client):
+    import app.db as db
+
+    db.create_user("default", "logout_twice_user", "Passw0rd123!", "user")
+    login_resp = anon_client.post(
+        "/auth/login", json={"username": "logout_twice_user", "password": "Passw0rd123!"}
+    )
+    token = login_resp.json()["token"]
+
+    # First logout succeeds.
+    resp = anon_client.post(
+        "/auth/logout", headers={"Authorization": f"Bearer {token}"}
+    )
+    assert resp.status_code == 200
+    # Second attempt with same (revoked) token is rejected.
+    resp2 = anon_client.post(
+        "/auth/logout", headers={"Authorization": f"Bearer {token}"}
+    )
+    assert resp2.status_code == 401
+
+
+def test_logout_api_key_returns_400(anon_client):
+    """API key sessions cannot use /auth/logout."""
+    resp = anon_client.post("/auth/logout", headers={"X-API-Key": "test-key"})
+    assert resp.status_code in (400, 401)  # 401 if key invalid, 400 if valid
+
+
+def test_other_sessions_not_affected_by_logout(anon_client):
+    """Logging out one token does not invalidate other tokens for the same user."""
+    import app.db as db
+    from app.security import make_login_token
+
+    user = db.create_user("default", "multi_session_user", "Passw0rd123!", "user")
+    token_a = make_login_token(user)
+    token_b = make_login_token(user)
+
+    # Revoke token_a.
+    resp = anon_client.post(
+        "/auth/logout", headers={"Authorization": f"Bearer {token_a}"}
+    )
+    assert resp.status_code == 200
+
+    # token_b still works.
+    resp2 = anon_client.get("/auth/me", headers={"Authorization": f"Bearer {token_b}"})
+    assert resp2.status_code == 200
+    assert resp2.json()["username"] == "multi_session_user"
+
+
+# ---------------------------------------------------------------------------
+# Tier 2: CORS configuration
+# ---------------------------------------------------------------------------
+
+
+def test_cors_wildcard_by_default(client):
+    """Without RAG_CORS_ORIGINS set, all origins are allowed."""
+    resp = client.options(
+        "/health",
+        headers={
+            "Origin": "https://evil.example.com",
+            "Access-Control-Request-Method": "GET",
+        },
+    )
+    # CORSMiddleware returns 405 for OPTIONS on routes that don't have
+    # OPTIONS handlers, but it still adds the CORS headers.
+    assert resp.headers.get("access-control-allow-origin") == "*"
+
+
+# ---------------------------------------------------------------------------
+# Tier 2: Global rate limiting
+# ---------------------------------------------------------------------------
+
+
+def test_global_rate_limit_blocks_heavy_requester(anon_client, monkeypatch):
+    """A requester exceeding the global per-IP limit gets 429."""
+    import app.main as main_mod
+
+    tiny = main_mod._SlidingWindowRateLimiter(max_requests=3, window_seconds=60)
+    monkeypatch.setattr(main_mod, "_global_rate_limiter", tiny)
+
+    # First 3 requests succeed (use a non-exempt path).
+    for _ in range(3):
+        assert anon_client.get("/auth/me").status_code == 401  # 401 (no creds), not 429
+    # 4th is blocked.
+    resp = anon_client.get("/auth/me")
+    assert resp.status_code == 429
+    assert "Retry-After" in resp.headers
+
+
+def test_health_check_bypasses_global_rate_limit(anon_client, monkeypatch):
+    """Health endpoints should not be rate-limited globally."""
+    import app.main as main_mod
+
+    tiny = main_mod._SlidingWindowRateLimiter(max_requests=1, window_seconds=60)
+    monkeypatch.setattr(main_mod, "_global_rate_limiter", tiny)
+
+    # Burn the one allowed request on a non-health endpoint.
+    anon_client.get("/auth/me")
+    # /health should still pass because it is exempt.
+    assert anon_client.get("/health").status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Tier 2: Security headers on API responses
+# ---------------------------------------------------------------------------
+
+
+def test_security_headers_on_auth_endpoint(client, monkeypatch):
+    """Security headers are present on authenticated endpoints too."""
+    resp = client.get("/auth/me", headers={"Authorization": "Bearer invalid"})
+    # Even a 401 response should carry security headers.
+    assert resp.headers["X-Content-Type-Options"] == "nosniff"
+    assert resp.headers["X-Frame-Options"] == "DENY"

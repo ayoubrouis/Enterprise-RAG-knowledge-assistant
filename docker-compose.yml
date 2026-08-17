@@ -16,6 +16,7 @@ services:
     volumes:
       - ./data:/app/data
       - ./models:/app/models
+      - ./backups:/app/backups
     environment:
       # Required: the api container refuses to start without a strong secret,
       # so an unset RAG_SECRET_KEY (missing .env) fails loudly instead of
@@ -38,7 +39,16 @@ services:
       RAG_LOGIN_MAX_FAILURES: ${RAG_LOGIN_MAX_FAILURES:-5}
       RAG_LOGIN_MAX_FAILURES_PER_IP: ${RAG_LOGIN_MAX_FAILURES_PER_IP:-20}
       RAG_LOGIN_FAILURE_WINDOW_SECONDS: ${RAG_LOGIN_FAILURE_WINDOW_SECONDS:-900}
+      RAG_CORS_ORIGINS: ${RAG_CORS_ORIGINS:-}
+      RAG_GLOBAL_RATE_LIMIT_MAX: ${RAG_GLOBAL_RATE_LIMIT_MAX:-120}
     restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=5)"]
       interval: 30s
