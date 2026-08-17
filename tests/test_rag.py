@@ -693,6 +693,406 @@ def test_query_returns_429_when_rate_limit_exceeded(client, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Tier 1 hardening: password rotation, API-key lifecycle, audit log, grounding,
+# upload caps, background ingest jobs, metrics/readiness.
+# ---------------------------------------------------------------------------
+
+
+def test_password_hash_embeds_cost_and_detects_rehash():
+    from app.security import (
+        PBKDF2_ITERATIONS,
+        hash_password,
+        needs_rehash,
+        verify_password,
+        verify_password_with_hash,
+    )
+
+    # A cost far below the configured one must be flagged for upgrade.
+    weak = hash_password("pw", iterations=100)
+    ok, parsed = verify_password_with_hash("pw", weak)
+    assert ok is True
+    assert parsed["iterations"] == 100
+    assert needs_rehash(parsed) is True
+
+    current = hash_password("pw", iterations=PBKDF2_ITERATIONS)
+    ok, parsed = verify_password_with_hash("pw", current)
+    assert ok is True
+    assert needs_rehash(parsed) is False
+    assert verify_password("pw", current) is True
+    assert verify_password("nope", current) is False
+
+    assert verify_password_with_hash("pw", "not-a-valid-hash") == (False, None)
+
+
+def test_update_password_hash_keeps_token_version_but_set_bumps_it():
+    import uuid
+
+    import app.db as db
+
+    username = f"tv-{uuid.uuid4().hex[:6]}"
+    db.create_user("default", username, "correct-horse-1", "user")
+    user_id = db.get_user_by_username(username)["id"]
+    assert db.get_user_by_id(user_id)["token_version"] == 0
+
+    # Transparent cost upgrade on login must NOT revoke existing sessions.
+    db.update_password_hash(user_id, "correct-horse-1")
+    assert db.get_user_by_id(user_id)["token_version"] == 0
+    # A deliberate password change revokes all prior sessions.
+    db.set_user_password(user_id, "new-password-123")
+    assert db.get_user_by_id(user_id)["token_version"] == 1
+
+
+def test_change_password_revokes_other_sessions(fresh_client):
+    setup = fresh_client.post(
+        "/auth/setup",
+        json={
+            "tenant_name": "Acme Corp",
+            "username": "boss",
+            "password": "SuperSecret123",
+        },
+    )
+    old_token = setup.json()["token"]
+    auth = {"Authorization": f"Bearer {old_token}"}
+
+    # Wrong current password is a 400 (not 401), so clients don't treat it as
+    # an expired session and force a re-login.
+    wrong = fresh_client.post(
+        "/auth/change-password",
+        headers=auth,
+        json={"old_password": "wrong", "new_password": "NewSuperSecret456"},
+    )
+    assert wrong.status_code == 400
+
+    same = fresh_client.post(
+        "/auth/change-password",
+        headers=auth,
+        json={"old_password": "SuperSecret123", "new_password": "SuperSecret123"},
+    )
+    assert same.status_code == 422
+
+    changed = fresh_client.post(
+        "/auth/change-password",
+        headers=auth,
+        json={"old_password": "SuperSecret123", "new_password": "NewSuperSecret456"},
+    )
+    assert changed.status_code == 200
+    new_token = changed.json()["token"]
+
+    # Every token signed before the change is now revoked.
+    assert fresh_client.get("/auth/me", headers=auth).status_code == 401
+    me = fresh_client.get("/auth/me", headers={"Authorization": f"Bearer {new_token}"})
+    assert me.status_code == 200
+    assert me.json()["username"] == "boss"
+
+    # The old password is dead; the new one logs in.
+    assert (
+        fresh_client.post(
+            "/auth/login", json={"username": "boss", "password": "SuperSecret123"}
+        ).status_code
+        == 401
+    )
+    login = fresh_client.post(
+        "/auth/login", json={"username": "boss", "password": "NewSuperSecret456"}
+    )
+    assert login.status_code == 200
+
+
+def test_api_key_disable_and_revoke(fresh_client):
+    import uuid
+
+    setup = fresh_client.post(
+        "/auth/setup",
+        json={
+            "tenant_name": "Acme Corp",
+            "username": "boss",
+            "password": "SuperSecret123",
+        },
+    )
+    assert setup.status_code == 200
+    # Real token (no dependency overrides) so API-key auth is exercised too.
+    admin = {"Authorization": f"Bearer {setup.json()['token']}"}
+
+    marker = uuid.uuid4().hex[:8]
+    created = fresh_client.post(
+        "/admin/tenants/default/api-keys",
+        headers=admin,
+        json={"label": f"ci-{marker}"},
+    )
+    assert created.status_code == 200
+    plain = created.json()["key"]
+
+    listed = fresh_client.get(
+        "/admin/tenants/default/api-keys", headers=admin
+    ).json()
+    record = next(k for k in listed if k["label"] == f"ci-{marker}")
+    key_hash = record["key_hash"]
+    assert record["is_active"] is True
+
+    headers = {"X-API-Key": plain}
+    me = fresh_client.get("/auth/me", headers=headers)
+    assert me.status_code == 200
+    assert me.json()["via"] == "api-key"
+
+    # Disable: the key stops authenticating but stays listed.
+    resp = fresh_client.patch(
+        f"/admin/tenants/default/api-keys/{key_hash}",
+        headers=admin,
+        json={"is_active": False},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["is_active"] is False
+    assert fresh_client.get("/auth/me", headers=headers).status_code == 401
+
+    # Re-enable: the same key works again (rotation without reissue).
+    resp = fresh_client.patch(
+        f"/admin/tenants/default/api-keys/{key_hash}",
+        headers=admin,
+        json={"is_active": True},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["is_active"] is True
+    assert fresh_client.get("/auth/me", headers=headers).status_code == 200
+
+    # Revoke: gone permanently, and unknown hashes 404 on every operation.
+    revoke = fresh_client.delete(
+        f"/admin/tenants/default/api-keys/{key_hash}", headers=admin
+    )
+    assert revoke.status_code == 200
+    assert revoke.json()["status"] == "revoked"
+    assert fresh_client.get("/auth/me", headers=headers).status_code == 401
+    assert (
+        fresh_client.delete(
+            f"/admin/tenants/default/api-keys/{key_hash}", headers=admin
+        ).status_code
+        == 404
+    )
+    assert (
+        fresh_client.patch(
+            f"/admin/tenants/default/api-keys/{key_hash}",
+            headers=admin,
+            json={"is_active": True},
+        ).status_code
+        == 404
+    )
+
+
+def test_audit_log_records_actions_and_scopes_tenants(client):
+    import uuid
+
+    marker = uuid.uuid4().hex[:8]
+    username = f"aud-{marker}"
+    client.post(
+        "/admin/tenants/default/users",
+        json={"username": username, "password": "correct-horse-1", "role": "user"},
+    )
+    client.post("/admin/tenants/default/api-keys", json={"label": f"aud-{marker}"})
+    listed = client.get("/admin/tenants/default/api-keys").json()
+    key_hash = next(k for k in listed if k["label"] == f"aud-{marker}")["key_hash"]
+    client.delete(f"/admin/tenants/default/api-keys/{key_hash}")
+    client.post(
+        "/auth/login", json={"username": "does-not-exist-xyz", "password": "wrong"}
+    )
+
+    logs = client.get("/admin/audit-logs").json()
+    actions = [(log["action"], log["detail"] or "") for log in logs]
+    assert any(a == "user.create" and username in d for a, d in actions)
+    assert any(a == "api_key.create" and marker in d for a, d in actions)
+    assert any(a == "api_key.revoke" for a, d in actions)
+    assert logs, "expected at least one audit entry"
+    # Enterprise admins only ever see their own tenant's audit trail.
+    assert all(log["tenant_id"] == "default" for log in logs)
+
+    # Failed logins carry no tenant (unknown user), so they are hidden from
+    # tenant-scoped views but still recorded for the platform admin.
+    import app.db as db
+
+    all_actions = [a["action"] for a in db.list_audit_logs(tenant_id=None)]
+    assert "login_failed" in all_actions
+
+
+def test_grounding_supported_accepts_grounded_and_rejects_fabrication():
+    from app.rag.grounding import grounding_supported
+
+    context = "The 401(k) plan has a company match of 50 percent up to 6 percent of salary."
+    assert grounding_supported("The plan has a company match of 50 percent", context)
+    assert not grounding_supported(
+        "The company matches 80 percent of unicorns in the nebula", context
+    )
+    # Abstentions and terse replies are never flagged as hallucinations.
+    assert grounding_supported("I don't know", context)
+    assert grounding_supported("Yes", context)
+    assert grounding_supported("", context)
+    # Without any evidence the check cannot pass.
+    assert not grounding_supported("the quick brown fox jumps over the lazy dog", "")
+
+
+def test_grounding_supported_honors_thresholds():
+    from app.rag.grounding import grounding_supported
+
+    # Overlap 1/4 < min_overlap=0.5 => unsupported.
+    assert not grounding_supported("foo bar baz qux", "foo", min_overlap=0.5, min_tokens=4)
+    # Short answers are too terse to judge and always pass.
+    assert grounding_supported("foo bar baz", "zzz", min_overlap=0.5, min_tokens=4)
+    # A lower overlap threshold accepts the partial match.
+    assert grounding_supported("foo bar baz qux", "foo", min_overlap=0.2, min_tokens=4)
+
+
+def test_upload_over_size_limit_rejected_without_partial_file(client, monkeypatch):
+    import uuid
+
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "MAX_UPLOAD_MB", 0.001)  # ~1 KiB cap
+    name = f"oversize-{uuid.uuid4().hex[:6]}.txt"
+    resp = client.post(
+        "/documents",
+        files={"file": (name, b"x" * (5 * 1024), "text/plain")},
+    )
+    assert resp.status_code == 413
+    names = {d["filename"] for d in client.get("/documents").json()}
+    assert name not in names  # no partial file was left behind
+
+
+def test_upload_queues_and_reports_background_job(client, monkeypatch):
+    import uuid
+
+    import app.main as main_mod
+    from app.config import settings
+    from app.schemas import IngestResponse
+
+    def fake_reindex(tenant_id):
+        return IngestResponse(
+            tenant_id=tenant_id, documents=2, chunks=9, saved_to="fake-store"
+        )
+
+    monkeypatch.setattr(main_mod, "_reindex", fake_reindex)
+    name = f"job-{uuid.uuid4().hex[:6]}.txt"
+    resp = client.post(
+        "/documents",
+        files={"file": (name, b"hello background ingest", "text/plain")},
+    )
+    assert resp.status_code == 202
+    queued = resp.json()
+    assert queued["status"] == "queued"
+    assert queued["tenant_id"] == "default"
+
+    # TestClient runs the background task synchronously, so the job is already
+    # reported as done by the time we poll.
+    status = client.get("/ingest/status").json()
+    assert status["status"] == "done"
+    assert status["documents"] == 2
+    assert status["chunks"] == 9
+    assert status["saved_to"] == "fake-store"
+
+    (settings.tenant_docs_dir("default") / name).unlink(missing_ok=True)
+
+
+def test_metrics_and_readiness(client):
+    ready = client.get("/health/ready")
+    assert ready.status_code == 200
+    body = ready.json()
+    assert body["status"] == "ready"
+    assert body["checks"] == {"database": True, "indexing_idle": True}
+
+    rendered = client.get("/metrics")
+    assert rendered.status_code == 200
+    assert "version=0.0.4" in rendered.headers["content-type"]
+    text = rendered.text
+    assert "# TYPE rag_http_requests_total counter" in text
+    assert "# TYPE rag_http_request_duration_seconds histogram" in text
+    assert "# TYPE rag_pipeline_cache_size gauge" in text
+    assert 'rag_http_requests_total{method="GET",path="/health",status="200"}' in text
+
+
+# ---------------------------------------------------------------------------
+# Bug-fix regression tests (audit-found issues)
+# ---------------------------------------------------------------------------
+
+
+def test_change_password_rejects_api_key_auth(fresh_client):
+    """API-key callers have no user_id and no stored password to verify."""
+    import app.db as db
+
+    setup = fresh_client.post(
+        "/auth/setup",
+        json={
+            "tenant_name": "Acme Corp",
+            "username": "boss",
+            "password": "SuperSecret123",
+        },
+    )
+    plain, _ = db.create_api_key("default", "test-key")
+    resp = fresh_client.post(
+        "/auth/change-password",
+        headers={"X-API-Key": plain},
+        json={"old_password": "SuperSecret123", "new_password": "NewSuperSecret456"},
+    )
+    assert resp.status_code == 400
+    assert "API key" in resp.json()["detail"]
+
+
+def test_middleware_exception_does_not_swallow_original(client):
+    """When an endpoint raises, the middleware must propagate the original
+    exception rather than replacing it with a RuntimeError from a double
+    ContextVar.reset()."""
+    from app.main import app as _app, get_pipeline_for_auth
+
+    class _BoomPipeline:
+        def answer(self, question, top_k=None):
+            raise ValueError("intentional test error")
+
+        def stats(self):
+            return {"documents": 0, "chunks": 0}
+
+    _app.dependency_overrides[get_pipeline_for_auth] = lambda: _BoomPipeline()
+    try:
+        with pytest.raises(ValueError, match="intentional test error"):
+            client.post("/query", json={"question": "boom"})
+    finally:
+        _app.dependency_overrides[get_pipeline_for_auth] = FakePipeline
+
+
+def test_histogram_inf_bucket_captures_all_observations():
+    from app.metrics import MetricsRegistry
+
+    reg = MetricsRegistry()
+    reg.register("test_hist", "test histogram")
+    reg.observe("test_hist", 100.0)  # above all defined finite buckets
+    reg.observe("test_hist", 0.5)
+    rendered = reg.render()
+    assert 'test_hist_bucket{le="+Inf"} 2' in rendered
+    assert "test_hist_count 2" in rendered
+    assert "test_hist_sum 100.5" in rendered
+
+
+def test_brute_force_settings_are_env_configurable(monkeypatch):
+    import importlib
+
+    import app.config as cfg
+
+    original_settings = cfg.settings
+
+    # Class-level attributes are evaluated at import time. Reload with env
+    # vars set to prove the os.environ.get() wiring works.
+    monkeypatch.setenv("RAG_LOGIN_MAX_FAILURES", "10")
+    monkeypatch.setenv("RAG_LOGIN_MAX_FAILURES_PER_IP", "50")
+    monkeypatch.setenv("RAG_LOGIN_FAILURE_WINDOW_SECONDS", "1800")
+    importlib.reload(cfg)
+    try:
+        assert cfg.settings.LOGIN_MAX_FAILURES == 10
+        assert cfg.settings.LOGIN_MAX_FAILURES_PER_IP == 50
+        assert cfg.settings.LOGIN_FAILURE_WINDOW_SECONDS == 1800
+    finally:
+        # Restore the original singleton so that other modules' cached
+        # `from app.config import settings` references remain valid.
+        monkeypatch.delenv("RAG_LOGIN_MAX_FAILURES")
+        monkeypatch.delenv("RAG_LOGIN_MAX_FAILURES_PER_IP")
+        monkeypatch.delenv("RAG_LOGIN_FAILURE_WINDOW_SECONDS")
+        importlib.reload(cfg)
+        cfg.settings = original_settings
+
+
+# ---------------------------------------------------------------------------
 # manage.py backup / restore
 # ---------------------------------------------------------------------------
 

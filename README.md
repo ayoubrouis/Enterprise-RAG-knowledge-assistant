@@ -15,18 +15,31 @@ free, open-source models. Designed to be sold/installed **on-prem per enterprise
 - **Multi-tenant** — every tenant is fully isolated on disk
   (`data/tenants/<tenant_id>/docs/` + `vectorstore/`); retrieval can never cross tenants.
 - **Authentication** — JWT-style login tokens + per-tenant API keys. Passwords hashed
-  with PBKDF2 (stdlib only, no paid deps). Login is brute-force protected: accounts are
-  locked after repeated failures and source IPs are throttled (rolling window).
+  with PBKDF2-HMAC-SHA256 at 600k iterations (stdlib only, no paid deps); old weak hashes
+  are transparently rehashed on the next successful login. Login is brute-force protected:
+  accounts are locked after repeated failures and source IPs are throttled (rolling window).
+- **Password rotation & session revocation** — users can change their own password
+  (UI or `POST /auth/change-password`); the change instantly revokes every other session.
+  API keys can be *disabled* (temporarily) or *revoked* (permanently) by an admin.
 - **Two admin tiers, no conflicts** — a *platform admin* (superadmin) runs the whole app
   (creates tenants, sees all logs); *enterprise admins* manage **only their own tenant**
   (users + API keys). Employees are tenant-scoped. No one can touch another enterprise.
-- **Document upload** — upload documents through the UI or API; the tenant index is
-  rebuilt automatically.
+- **Document upload** — upload documents through the UI or API; the tenant index rebuilds
+  asynchronously (a background job, pollable via `/ingest/status`). Uploads are capped
+  (`RAG_MAX_UPLOAD_MB`, default 50 MiB) and oversized files return 413 with no partial
+  file left behind.
 - **Ingestion pipeline** — loads `.pdf` / `.txt` / `.md` / `.docx`, chunks them with
   overlap, embeds them, and persists a FAISS index per tenant.
-- **Grounded generation** — answers use *only* retrieved context and say "I don't know"
-  when the documents don't contain the answer.
+- **Grounded generation + guardrail** — answers use *only* retrieved context and say
+  "I don't know" when the documents don't contain the answer. A lexical grounding check
+  validates each answer against its context and refuses to surface fabrications.
 - **Source citations** — every answer returns the source file, page, similarity, and snippet.
+- **Audit log** — append-only record of admin/auth actions (setup, logins, password
+  changes, user/API-key/tenant management, uploads), tenant-scoped for enterprise admins
+  and fully visible to the platform admin (`GET /admin/audit-logs`).
+- **Observability** — JSON structured logs with `X-Request-ID` correlation across
+  UI/API requests, Prometheus metrics at `/metrics`, and a `/health/ready` readiness probe
+  used by the Docker healthcheck.
 - **Three LLM backends** — in-process transformers (default, any CPU), Ollama (CPU/GPU),
   or vLLM (NVIDIA GPU). Swap via one environment variable.
 - **REST API** — FastAPI with interactive Swagger docs at `/docs`.
@@ -47,14 +60,17 @@ free, open-source models. Designed to be sold/installed **on-prem per enterprise
 │   ├── config.py            # every tunable setting in one place
 │   ├── main.py              # FastAPI backend (multi-tenant, auth, admin)
 │   ├── security.py          # PBKDF2 hashing, signed tokens, API keys (stdlib)
-│   ├── db.py                # SQLite: tenants, users, keys, query logs (stdlib)
+│   ├── db.py                # SQLite: tenants, users, keys, query + audit logs (stdlib)
 │   ├── auth.py              # FastAPI auth dependency -> tenant context
+│   ├── metrics.py           # Prometheus counters/gauges/histograms (stdlib)
+│   ├── logging_utils.py     # JSON structured logs + request-id correlation
 │   ├── schemas.py           # API request/response models
 │   ├── rag/
 │   │   ├── embeddings.py    # local embedding model (cached singleton)
 │   │   ├── llm.py           # LLM backends: transformers / OpenAI-compatible
 │   │   ├── ingestion.py     # load + chunk documents
 │   │   ├── vectorstore.py   # per-tenant FAISS build / save / load
+│   │   ├── grounding.py     # lexical answer-grounding guardrail
 │   │   └── pipeline.py      # tenant-scoped retrieve -> ground -> generate -> cite
 │   ├── ui/streamlit_app.py  # chat UI (login + upload + admin)
 │   └── eval/evaluate.py     # retrieval precision/recall/MRR metrics
@@ -153,6 +169,7 @@ index rebuilds automatically. Or drop files into `data/tenants/default/docs/` an
 .\.venv\Scripts\python scripts\manage.py create-tenant --id acme --name "Acme Corp"
 .\.venv\Scripts\python scripts\manage.py create-user --tenant acme --username alice --role user
 .\.venv\Scripts\python scripts\manage.py create-api-key --tenant acme --label "prod"
+.\.venv\Scripts\python scripts\manage.py revoke-api-key --tenant acme --key <key-hash>
 .\.venv\Scripts\python scripts\manage.py list-tenants
 ```
 
@@ -181,17 +198,21 @@ from the credentials, never from the request body.
 | Method   | Path                                     | Auth  | Description                                   |
 |----------|------------------------------------------|-------|-----------------------------------------------|
 | GET      | `/health`                                | none  | Liveness check                                |
+| GET      | `/health/ready`                          | none  | Readiness probe (`database`, `indexing_idle`) |
+| GET      | `/metrics`                               | none  | Prometheus metrics (text exposition format)   |
 | GET      | `/`                                      | none  | Service info                                  |
 | GET      | `/auth/setup`                            | none  | `{"needed": bool}` first-run setup status     |
 | POST     | `/auth/setup`                            | none  | One-time first-run wizard (`tenant_name`,`username`,`password`) -> token; 409 if already set up |
 | POST     | `/auth/login`                            | none  | `{"username","password"}` -> token            |
+| POST     | `/auth/change-password`                  | user  | `{"old_password","new_password"}` -> new token; revokes all other sessions |
 | GET      | `/auth/me`                               | user  | Current user + tenant                         |
 | GET      | `/stats`                                 | user  | Tenant docs/chunks indexed                    |
-| POST     | `/query`                                 | user  | `{"question","top_k"}` -> answer + sources    |
+| POST     | `/query`                                 | user  | `{"question","top_k"}` -> answer + sources (+ `grounded`) |
 | GET      | `/documents`                             | user  | Files stored for this tenant                  |
-| POST     | `/documents`                             | user  | Multipart upload + re-index                   |
-| DELETE   | `/documents/{filename}`                  | user  | Remove a file + re-index                      |
-| POST     | `/ingest`                                | user  | Rebuild this tenant's index                   |
+| POST     | `/documents`                             | user  | Multipart upload -> **202** `JobStatus`, re-index runs in background (413 over the size cap) |
+| DELETE   | `/documents/{filename}`                  | user  | Remove a file -> **202** `JobStatus`, re-index runs in background |
+| POST     | `/ingest`                                | user  | Rebuild this tenant's index -> **202** `JobStatus` |
+| GET      | `/ingest/status`                         | user  | Current index job: `idle\|queued\|running\|done\|failed` |
 | POST     | `/admin/tenants`                         | superadmin | Create a tenant                               |
 | GET      | `/admin/tenants`                         | superadmin | List tenants (with counts)                    |
 | PATCH    | `/admin/tenants/{id}`                    | superadmin | Enable/disable a tenant                       |
@@ -200,7 +221,10 @@ from the credentials, never from the request body.
 | PATCH    | `/admin/tenants/{id}/users/{username}`   | tenant admin (own tenant) | Enable/disable a user          |
 | POST     | `/admin/tenants/{id}/api-keys`           | tenant admin (own tenant) | Create an API key (shown once) |
 | GET      | `/admin/tenants/{id}/api-keys`           | tenant admin (own tenant) | List API keys (hashes only)    |
+| PATCH    | `/admin/tenants/{id}/api-keys/{hash}`    | tenant admin (own tenant) | Enable/disable an API key       |
+| DELETE   | `/admin/tenants/{id}/api-keys/{hash}`    | tenant admin (own tenant) | Permanently revoke an API key   |
 | GET      | `/admin/logs?tenant_id=&limit=`          | tenant admin (own tenant) / superadmin (any) | Recent query log |
+| GET      | `/admin/audit-logs?tenant_id=&limit=`    | tenant admin (own tenant) / superadmin (any) | Append-only audit trail |
 
 Example:
 
@@ -283,9 +307,13 @@ See [ENTERPRISE.md](ENTERPRISE.md) for the full on-prem install/upgrade/monitori
 
 ### Tuning
 
-All knobs live in `app/config.py`: `CHUNK_SIZE`, `CHUNK_OVERLAP`, `TOP_K`,
-`EMBEDDING_MODEL`, `LLM_MODEL`, `MAX_NEW_TOKENS`. After changing `LLM_MODEL` for the
-`transformers` backend, re-run `scripts/download_model.py`.
+All knobs live in `app/config.py`. Chunking/retrieval internals (`CHUNK_SIZE`,
+`CHUNK_OVERLAP`, `TOP_K`, `EMBEDDING_MODEL`, `LLM_MODEL`, `MAX_NEW_TOKENS`) are set in
+code; deployment tunables are env vars — see `.env.example` for upload caps
+(`RAG_MAX_UPLOAD_MB`), PBKDF2 cost (`RAG_PBKDF2_ITERATIONS`), the grounding guardrail
+(`RAG_GROUNDING_*`), audit-log retention (`RAG_AUDIT_LOG_RETENTION_DAYS`), and query
+rate limits. After changing `LLM_MODEL` for the `transformers` backend, re-run
+`scripts/download_model.py`.
 
 ---
 
@@ -317,7 +345,9 @@ this just means the retriever adds filler context, which is normal in RAG.
 ```
 
 Tests need no network and no model downloads (the API tests inject a fake pipeline and
-use a throwaway SQLite file).
+use a throwaway SQLite file). The suite covers auth, tenant/admin scoping, token
+revocation on password change, API-key disable/revoke, the audit log, grounding checks,
+upload caps, background ingest jobs, and metrics/readiness.
 
 ---
 

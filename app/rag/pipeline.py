@@ -11,6 +11,7 @@ from __future__ import annotations
 from langchain_community.vectorstores import FAISS
 
 from app.config import settings
+from app.rag.grounding import grounding_supported
 from app.rag.llm import get_llm
 from app.rag.vectorstore import load_vectorstore
 
@@ -23,6 +24,10 @@ Context:
 Question: {question}
 
 Answer:"""
+
+
+def _abstain() -> str:
+    return "I don't know."
 
 
 class RAGPipeline:
@@ -60,7 +65,7 @@ class RAGPipeline:
     # Generation
     # ------------------------------------------------------------------ #
     def answer(self, question: str, top_k: int | None = None) -> dict:
-        """Full RAG query: returns {question, answer, sources}."""
+        """Full RAG query: returns {question, answer, sources, grounded}."""
         results = self.retrieve(question, k=top_k)
 
         context = "\n\n".join(
@@ -71,9 +76,17 @@ class RAGPipeline:
         llm = get_llm()
         answer = llm(prompt)
 
+        # Hallucination guardrail: refuse answers that are not supported by the
+        # retrieved context instead of surfacing a fabrication.
+        grounded = True
+        if settings.GROUNDING_CHECK and not grounding_supported(answer, context):
+            answer = _abstain()
+            grounded = False
+
         return {
             "question": question,
             "answer": answer,
+            "grounded": grounded,
             "sources": [
                 {
                     "source": r["source"],

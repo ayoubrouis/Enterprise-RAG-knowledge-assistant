@@ -115,6 +115,35 @@ class Settings:
     # admin is auto-seeded at first boot with this password.
     ADMIN_PASSWORD: str = os.environ.get("RAG_ADMIN_PASSWORD", "")
 
+    # ---- Password hashing -------------------------------------------------
+    # OWASP-recommended PBKDF2-HMAC-SHA256 cost factor. Existing hashes store
+    # their own iteration count, so a running system rehashes on the next
+    # successful login whenever this value changes (see app/security.py).
+    PBKDF2_ITERATIONS: int = int(os.environ.get("RAG_PBKDF2_ITERATIONS", "600000"))
+
+    # ---- Upload limits ----------------------------------------------------
+    # Hard cap on a single uploaded document (MiB). Prevents a runaway upload
+    # from filling the disk; rejects with 413 when exceeded.
+    MAX_UPLOAD_MB: int = int(os.environ.get("RAG_MAX_UPLOAD_MB", "50"))
+
+    # ---- Answer grounding (hallucination guardrail) -----------------------
+    # After the LLM generates an answer, the pipeline checks that a meaningful
+    # fraction of the answer's content words actually appear in the retrieved
+    # context. When the answer is unsupported (or the check cannot be judged),
+    # the pipeline replies "I don't know." instead of surfacing a fabrication.
+    GROUNDING_CHECK: bool = os.environ.get("RAG_GROUNDING_CHECK", "1") == "1"
+    GROUNDING_MIN_OVERLAP: float = float(
+        os.environ.get("RAG_GROUNDING_MIN_OVERLAP", "0.5")
+    )
+    GROUNDING_MIN_TOKENS: int = int(os.environ.get("RAG_GROUNDING_MIN_TOKENS", "4"))
+
+    # ---- Audit log --------------------------------------------------------
+    # Admin/auth actions are written to an append-only audit table. Old rows
+    # are pruned opportunistically (on insert) beyond this retention window.
+    AUDIT_LOG_RETENTION_DAYS: int = int(
+        os.environ.get("RAG_AUDIT_LOG_RETENTION_DAYS", "365")
+    )
+
     # ---- UI ----------------------------------------------------------------
     # Where the Streamlit UI (a separate process) reaches the FastAPI backend.
     API_BASE_URL: str = os.environ.get("RAG_API_BASE_URL", "http://127.0.0.1:8000")
@@ -123,9 +152,9 @@ class Settings:
     # Login failures are recorded per (username, ip) and enforced inside a
     # rolling window. Exceeding the per-username limit locks that account;
     # exceeding the per-IP limit throttles the whole source address.
-    LOGIN_MAX_FAILURES: int = 5                 # per username, per window
-    LOGIN_MAX_FAILURES_PER_IP: int = 20         # per source IP, per window
-    LOGIN_FAILURE_WINDOW_SECONDS: int = 900     # rolling 15-minute window
+    LOGIN_MAX_FAILURES: int = int(os.environ.get("RAG_LOGIN_MAX_FAILURES", "5"))
+    LOGIN_MAX_FAILURES_PER_IP: int = int(os.environ.get("RAG_LOGIN_MAX_FAILURES_PER_IP", "20"))
+    LOGIN_FAILURE_WINDOW_SECONDS: int = int(os.environ.get("RAG_LOGIN_FAILURE_WINDOW_SECONDS", "900"))
 
     # ---- Query rate limiting --------------------------------------------
     # Sliding-window cap on /query (the expensive LLM + FAISS endpoint),

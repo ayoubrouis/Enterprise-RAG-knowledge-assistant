@@ -19,30 +19,54 @@ import time
 
 from app.config import settings
 
-PBKDF2_ITERATIONS = 120_000
+# PBKDF2-HMAC-SHA256 cost factor for NEW password hashes. OWASP currently
+# recommends >= 600k iterations. Stored hashes keep their own iteration count
+# (the string embeds it), so raising this never breaks existing accounts;
+# verify_password() transparently rehashes to the current cost on the next
+# successful login (see needs_rehash / rehash below).
+PBKDF2_ITERATIONS: int = settings.PBKDF2_ITERATIONS
 
 
 # ---------------------------------------------------------------------------
 # Passwords (PBKDF2-HMAC-SHA256, salted)
 # ---------------------------------------------------------------------------
 
-def hash_password(password: str) -> str:
+def hash_password(password: str, iterations: int | None = None) -> str:
+    iterations = iterations or PBKDF2_ITERATIONS
     salt = os.urandom(16)
     digest = hashlib.pbkdf2_hmac(
-        "sha256", password.encode("utf-8"), salt, PBKDF2_ITERATIONS
+        "sha256", password.encode("utf-8"), salt, iterations
     )
-    return f"pbkdf2${PBKDF2_ITERATIONS}${salt.hex()}${digest.hex()}"
+    return f"pbkdf2${iterations}${salt.hex()}${digest.hex()}"
 
 
 def verify_password(password: str, stored: str) -> bool:
+    """True when ``password`` matches ``stored``. Also returns the parsed hash
+    via ``verify_password_with_hash`` when the caller needs rehash info."""
+    ok, _ = verify_password_with_hash(password, stored)
+    return ok
+
+
+def verify_password_with_hash(password: str, stored: str) -> tuple[bool, dict | None]:
+    """(matches, parsed_hash). ``parsed_hash`` is None when the stored string
+    is malformed; otherwise it carries the embedded iteration count so the
+    caller can decide whether to rehash to the current cost."""
     try:
         _, iterations, salt_hex, hash_hex = stored.split("$")
+        iterations = int(iterations)
         digest = hashlib.pbkdf2_hmac(
-            "sha256", password.encode("utf-8"), bytes.fromhex(salt_hex), int(iterations)
+            "sha256", password.encode("utf-8"), bytes.fromhex(salt_hex), iterations
         )
-        return hmac.compare_digest(digest.hex(), hash_hex)
+        return hmac.compare_digest(digest.hex(), hash_hex), {
+            "iterations": iterations,
+        }
     except (ValueError, AttributeError):
-        return False
+        return False, None
+
+
+def needs_rehash(parsed: dict | None) -> bool:
+    """True when a stored hash was created with an older, weaker cost."""
+    return bool(parsed) and parsed["iterations"] < PBKDF2_ITERATIONS
 
 
 # ---------------------------------------------------------------------------
@@ -66,6 +90,20 @@ def sign_token(payload: dict, ttl_seconds: int | None = None) -> str:
         settings.SECRET_KEY.encode("utf-8"), encoded.encode("ascii"), hashlib.sha256
     ).digest()
     return f"{encoded}.{_b64encode(signature)}"
+
+
+def make_login_token(user: dict) -> str:
+    """Sign a token for a DB user row, binding the user's current token
+    version. When the password changes (token_version is bumped) every token
+    signed before that bump stops verifying, i.e. sessions are revoked."""
+    return sign_token(
+        {
+            "uid": user["id"],
+            "tid": user["tenant_id"],
+            "role": user["role"],
+            "tv": user.get("token_version", 0),
+        }
+    )
 
 
 def verify_token(token: str) -> dict:

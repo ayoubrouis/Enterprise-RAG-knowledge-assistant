@@ -9,6 +9,7 @@ Usage:
     python scripts/manage.py create-user --tenant acme --username alice --role user
     python scripts/manage.py create-admin --username root
     python scripts/manage.py create-api-key --tenant acme --label "prod"
+    python scripts/manage.py revoke-api-key --tenant acme --key <key_hash>
     python scripts/manage.py list-tenants
     python scripts/manage.py list-users --tenant acme
     python scripts/manage.py reset-password --username alice
@@ -128,6 +129,28 @@ def cmd_list_tenants(_: argparse.Namespace) -> None:
             f"{db.count_users(t['tenant_id']):<5} {db.count_documents(t['tenant_id']):<4} "
             f"{db.count_api_keys(t['tenant_id']):<8} {t['is_active']}"
         )
+
+
+def cmd_revoke_api_key(args: argparse.Namespace) -> None:
+    """Permanently revoke an API key (shown as a truncated hash in list users
+    / the admin UI). Irreversible - integrations using it stop working."""
+    db.seed_defaults()
+    if not db.get_tenant(args.tenant):
+        print(f"Error: tenant '{args.tenant}' does not exist.")
+        sys.exit(1)
+    keys = db.list_api_keys(args.tenant)
+    key = next((k for k in keys if k["key_hash"] == args.key), None)
+    if key is None:
+        print(f"Error: no API key matching '{args.key}' in tenant '{args.tenant}'.")
+        print("Available keys:")
+        for k in keys:
+            print(f"  {k['key_hash']}  ({k['label'] or 'no label'})")
+        sys.exit(1)
+    db.delete_api_key(args.tenant, args.key)
+    db.log_audit(
+        args.tenant, "cli", None, "api_key.revoke", f"key={args.key[:12]}..."
+    )
+    print(f"Revoked API key {args.key[:12]}... for tenant '{args.tenant}'.")
 
 
 def cmd_list_users(args: argparse.Namespace) -> None:
@@ -282,6 +305,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--tenant", default=settings.DEFAULT_TENANT)
     p.add_argument("--label", default="")
     p.set_defaults(func=cmd_create_api_key)
+
+    p = sub.add_parser("revoke-api-key", help="Permanently revoke an API key")
+    p.add_argument("--tenant", default=settings.DEFAULT_TENANT)
+    p.add_argument("--key", required=True, help="The full key hash (from list-tenants / admin UI)")
+    p.set_defaults(func=cmd_revoke_api_key)
 
     sub.add_parser("list-tenants", help="List tenants").set_defaults(func=cmd_list_tenants)
 

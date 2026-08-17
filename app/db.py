@@ -69,6 +69,7 @@ def _init_schema() -> None:
                 password_hash TEXT NOT NULL,
                 role          TEXT NOT NULL CHECK (role IN ('superadmin','admin','user')),
                 is_active     INTEGER NOT NULL DEFAULT 1,
+                token_version INTEGER NOT NULL DEFAULT 0,
                 created_at    REAL NOT NULL
             );
             CREATE TABLE IF NOT EXISTS api_keys (
@@ -93,13 +94,27 @@ def _init_schema() -> None:
                 ip         TEXT NOT NULL,
                 created_at REAL NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS audit_logs (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at REAL NOT NULL,
+                actor      TEXT NOT NULL,
+                actor_role TEXT,
+                tenant_id  TEXT,
+                action     TEXT NOT NULL,
+                detail     TEXT
+            );
             CREATE INDEX IF NOT EXISTS idx_login_failures_user_time
                 ON login_failures(username, created_at);
             CREATE INDEX IF NOT EXISTS idx_login_failures_ip_time
                 ON login_failures(ip, created_at);
+            CREATE INDEX IF NOT EXISTS idx_audit_tenant_time
+                ON audit_logs(tenant_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_audit_actor_time
+                ON audit_logs(actor, created_at);
             """
         )
         _migrate_role_column(conn)
+        _migrate_users_schema(conn)
 
 
 def _migrate_role_column(conn: sqlite3.Connection) -> None:
@@ -118,13 +133,24 @@ def _migrate_role_column(conn: sqlite3.Connection) -> None:
             password_hash TEXT NOT NULL,
             role          TEXT NOT NULL CHECK (role IN ('superadmin','admin','user')),
             is_active     INTEGER NOT NULL DEFAULT 1,
+            token_version INTEGER NOT NULL DEFAULT 0,
             created_at    REAL NOT NULL
         );
-        INSERT INTO users_new SELECT * FROM users;
+        INSERT INTO users_new (id, tenant_id, username, password_hash, role, is_active, created_at)
+            SELECT id, tenant_id, username, password_hash, role, is_active, created_at FROM users;
         DROP TABLE users;
         ALTER TABLE users_new RENAME TO users;
         """
     )
+
+
+def _migrate_users_schema(conn: sqlite3.Connection) -> None:
+    """Add the token_version column to users tables created before it existed."""
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(users)").fetchall()}
+    if "token_version" not in cols:
+        conn.execute(
+            "ALTER TABLE users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 0"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -319,6 +345,19 @@ def set_user_active(user_id: int, active: bool) -> None:
 
 
 def set_user_password(user_id: int, password: str) -> None:
+    """Reset a user's password and bump their token version so every login
+    token signed before this change stops working (sessions are revoked)."""
+    with tx() as conn:
+        conn.execute(
+            "UPDATE users SET password_hash = ?, token_version = token_version + 1 "
+            "WHERE id = ?",
+            (hash_password(password), user_id),
+        )
+
+
+def update_password_hash(user_id: int, password: str) -> None:
+    """Rehash an already-verified password at the current cost without bumping
+    the token version (used on login when a stored hash is older/weaker)."""
     with tx() as conn:
         conn.execute(
             "UPDATE users SET password_hash = ? WHERE id = ?",
@@ -356,6 +395,28 @@ def list_api_keys(tenant_id: str) -> list[dict]:
             (tenant_id,),
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def set_api_key_active(tenant_id: str, key_hash: str, active: bool) -> bool:
+    """Enable/disable an API key. Returns False when no such key exists in the
+    tenant (the caller should 404)."""
+    with tx() as conn:
+        cur = conn.execute(
+            "UPDATE api_keys SET is_active = ? WHERE key_hash = ? AND tenant_id = ?",
+            (1 if active else 0, key_hash, tenant_id),
+        )
+    return cur.rowcount > 0
+
+
+def delete_api_key(tenant_id: str, key_hash: str) -> bool:
+    """Permanently remove an API key. Returns False when it did not exist in
+    the tenant (the caller should 404)."""
+    with tx() as conn:
+        cur = conn.execute(
+            "DELETE FROM api_keys WHERE key_hash = ? AND tenant_id = ?",
+            (key_hash, tenant_id),
+        )
+    return cur.rowcount > 0
 
 
 # ---------------------------------------------------------------------------
@@ -425,3 +486,41 @@ def clear_login_failures(username: str) -> None:
     """Wipe failure history for a user who just signed in successfully."""
     with tx() as conn:
         conn.execute("DELETE FROM login_failures WHERE username = ?", (username,))
+
+
+# ---------------------------------------------------------------------------
+# Audit log (append-only record of admin/auth actions)
+# ---------------------------------------------------------------------------
+
+def log_audit(
+    tenant_id: str | None,
+    actor: str,
+    actor_role: str | None,
+    action: str,
+    detail: str | None = None,
+) -> None:
+    """Append an immutable audit entry. Old rows are pruned opportunistically
+    (on insert) beyond the configured retention window so the table stays
+    bounded while remaining append-only in normal operation."""
+    cutoff = time.time() - settings.AUDIT_LOG_RETENTION_DAYS * 86400
+    with tx() as conn:
+        conn.execute(
+            "INSERT INTO audit_logs (created_at, actor, actor_role, tenant_id, action, detail) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (time.time(), actor, actor_role, tenant_id, action, detail),
+        )
+        conn.execute("DELETE FROM audit_logs WHERE created_at < ?", (cutoff,))
+
+
+def list_audit_logs(tenant_id: str | None = None, limit: int = 100) -> list[dict]:
+    with tx() as conn:
+        if tenant_id:
+            rows = conn.execute(
+                "SELECT * FROM audit_logs WHERE tenant_id = ? ORDER BY id DESC LIMIT ?",
+                (tenant_id, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM audit_logs ORDER BY id DESC LIMIT ?", (limit,)
+            ).fetchall()
+    return [dict(r) for r in rows]

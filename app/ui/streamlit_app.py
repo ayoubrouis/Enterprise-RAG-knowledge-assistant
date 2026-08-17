@@ -11,6 +11,7 @@ container that talks to the API service over the compose network.
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 from urllib.parse import quote
 
@@ -41,6 +42,16 @@ def _request(method: str, path: str, **kw) -> httpx.Response:
         st.session_state.pop("user", None)
         st.rerun()
     return resp
+
+
+def _wait_for_ingest() -> dict | None:
+    """Poll the background re-index job until it settles (or times out)."""
+    for _ in range(300):
+        time.sleep(0.5)
+        r = _request("get", "/ingest/status")
+        if r.status_code == 200 and r.json().get("status") in ("done", "failed", "idle"):
+            return r.json()
+    return None
 
 
 st.set_page_config(page_title="Enterprise RAG Assistant", page_icon=":material/search:")
@@ -130,7 +141,7 @@ with st.sidebar:
         type=[ext.lstrip(".") for ext in settings.SUPPORTED_EXTENSIONS],
     )
     if uploaded is not None and st.button("Upload & index", type="primary"):
-        with st.spinner("Uploading, embedding, and indexing..."):
+        with st.spinner("Uploading and indexing..."):
             resp = _request(
                 "post",
                 "/documents",
@@ -142,9 +153,14 @@ with st.sidebar:
                     )
                 },
             )
-        if resp.status_code == 200:
-            info = resp.json()
-            st.success(f"Indexed {info['documents']} document(s) / {info['chunks']} chunk(s).")
+            job = _wait_for_ingest() if resp.status_code in (200, 202) else None
+        if resp.status_code in (200, 202):
+            if job and job.get("status") == "done":
+                st.success(f"Indexed {job['documents']} document(s) / {job['chunks']} chunk(s).")
+            elif job and job.get("status") == "failed":
+                st.error(job.get("error") or "Indexing failed.")
+            else:
+                st.success("Document uploaded; indexing may still be running.")
             st.rerun()
         else:
             st.error(resp.text)
@@ -152,8 +168,14 @@ with st.sidebar:
     if st.button("Rebuild index from stored docs"):
         with st.spinner("Rebuilding index..."):
             resp = _request("post", "/ingest")
-        if resp.status_code == 200:
-            st.success("Index rebuilt.")
+            job = _wait_for_ingest() if resp.status_code in (200, 202) else None
+        if resp.status_code in (200, 202):
+            if job and job.get("status") == "done":
+                st.success(f"Index rebuilt ({job['chunks']} chunks).")
+            elif job and job.get("status") == "failed":
+                st.error(job.get("error") or "Indexing failed.")
+            else:
+                st.success("Rebuild queued.")
             st.rerun()
         else:
             st.error(resp.text)
@@ -166,10 +188,35 @@ with st.sidebar:
             col1, col2 = st.columns([5, 1])
             col1.write(doc["filename"])
             if col2.button("x", key=f"del_{doc['filename']}"):
-                _request("delete", f"/documents/{quote(doc['filename'])}")
+                resp = _request("delete", f"/documents/{quote(doc['filename'])}")
+                if resp.status_code in (200, 202):
+                    _wait_for_ingest()
                 st.rerun()
 
     st.divider()
+    with st.expander("Change password"):
+        old_pw = st.text_input("Current password", type="password", key="cp_old")
+        new_pw = st.text_input("New password (min 8 chars)", type="password", key="cp_new")
+        confirm_pw = st.text_input("Confirm new password", type="password", key="cp_confirm")
+        if st.button("Update password", type="primary"):
+            if not old_pw:
+                st.error("Enter your current password.")
+            elif len(new_pw) < 8:
+                st.error("New password must be at least 8 characters.")
+            elif new_pw != confirm_pw:
+                st.error("New passwords do not match.")
+            else:
+                r = _request(
+                    "post",
+                    "/auth/change-password",
+                    json={"old_password": old_pw, "new_password": new_pw},
+                )
+                if r.status_code == 200:
+                    st.session_state.token = r.json()["token"]
+                    st.success("Password updated. Other sessions were signed out.")
+                else:
+                    st.error(r.text)
+
     st.caption(f"Embedding model: `{settings.EMBEDDING_MODEL}`")
     st.caption(f"LLM backend: `{settings.LLM_BACKEND}` · model `{settings.LLM_MODEL}`")
 
@@ -242,7 +289,18 @@ def _tenant_management(tenant_id: str, can_disable: bool, t: dict) -> None:
     st.write("**API keys**")
     keys = _request("get", f"/admin/tenants/{tenant_id}/api-keys").json()
     for k in keys:
-        st.caption(f"{k['label'] or '(no label)'} · `{k['key_hash'][:12]}…` · {'active' if k['is_active'] else 'disabled'}")
+        col1, col2, col3 = st.columns([4, 2, 1])
+        col1.caption(f"{k['label'] or '(no label)'} · `{k['key_hash'][:12]}…` · {'active' if k['is_active'] else 'disabled'}")
+        if col2.button("Disable" if k["is_active"] else "Enable", key=f"ktog_{tenant_id}_{k['key_hash']}"):
+            _request(
+                "patch",
+                f"/admin/tenants/{tenant_id}/api-keys/{k['key_hash']}",
+                json={"is_active": not k["is_active"]},
+            )
+            st.rerun()
+        if col3.button("Revoke", key=f"kdel_{tenant_id}_{k['key_hash']}"):
+            _request("delete", f"/admin/tenants/{tenant_id}/api-keys/{k['key_hash']}")
+            st.rerun()
     with st.form(f"new_key_{tenant_id}"):
         label = st.text_input("Label", key=f"nk_{tenant_id}")
         if st.form_submit_button("Create API key"):
@@ -298,6 +356,17 @@ def admin_panel() -> None:
         title = f"{user['tenant_name']} · `{tid}` · {'active'}"
         with st.expander(title):
             _tenant_management(tid, can_disable=False, t={})
+
+    st.divider()
+    st.write("**Audit log**")
+    logs_resp = _request("get", "/admin/audit-logs?limit=50")
+    if logs_resp.status_code == 200:
+        for e in logs_resp.json():
+            when = time.strftime("%Y-%m-%d %H:%M", time.localtime(e["created_at"]))
+            detail = f" — {e['detail']}" if e.get("detail") else ""
+            st.caption(f"{when} · `{e['actor']}` · {e['action']}{detail}")
+    else:
+        st.caption("(unable to load audit log)")
 
 
 # ---------------------------------------------------------------------------

@@ -43,3 +43,12 @@ def load_vectorstore(tenant_id: str | None = None) -> FAISS | None:
 def store_exists(tenant_id: str | None = None) -> bool:
     directory = settings.tenant_vectorstore_dir(tenant_id or settings.DEFAULT_TENANT)
     return (directory / "index.faiss").exists()
+
+
+def delete_vectorstore(tenant_id: str | None = None) -> None:
+    """Remove a tenant's persisted index (used when its docs are all gone)."""
+    import shutil
+
+    directory = settings.tenant_vectorstore_dir(tenant_id or settings.DEFAULT_TENANT)
+    if directory.exists():
+        shutil.rmtree(directory, ignore_errors=True)

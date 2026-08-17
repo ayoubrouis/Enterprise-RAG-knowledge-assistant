@@ -13,3 +13,7 @@ os.environ.setdefault("RAG_SECRET_KEY", "test-secret-0123456789abcdef")
 # Keep the shared /query rate limiter from interfering across tests; the
 # limiter itself is exercised directly by dedicated tests.
 os.environ.setdefault("RAG_QUERY_RATE_LIMIT_MAX", "1000000")
+# PBKDF2 at 600k iterations is the production default but makes login-heavy
+# tests impractically slow. Lower it here; the rehash-on-login path is still
+# exercised directly by a dedicated unit test with explicit iteration counts.
+os.environ.setdefault("RAG_PBKDF2_ITERATIONS", "1000")

@@ -78,6 +78,15 @@ Set at minimum:
 | `RAG_DB_PATH`             | Optional: override just the SQLite auth database file (defaults to `$RAG_DATA_DIR/system.db`). |
 | `RAG_QUERY_RATE_LIMIT_MAX` | Optional: max `/query` calls per caller per sliding window (default 30). Guards the LLM+FAISS endpoint against abuse / runaway cost. |
 | `RAG_QUERY_RATE_LIMIT_WINDOW_SECONDS` | Optional: sliding window length for the above (default 60). |
+| `RAG_MAX_UPLOAD_MB` | Optional: hard cap on a single uploaded document in MiB (default 50). Oversized uploads get a 413 and leave no partial file. |
+| `RAG_PBKDF2_ITERATIONS` | Optional: PBKDF2-HMAC-SHA256 cost for **new** password hashes (default 600000). Old hashes are rehashed on next login — raising this never breaks accounts. |
+| `RAG_GROUNDING_CHECK` | Optional: enable the answer-grounding guardrail (default `1`). Set `0` only to disable. |
+| `RAG_GROUNDING_MIN_OVERLAP` | Optional: min fraction of answer content words that must appear in the retrieved context (default 0.5). |
+| `RAG_GROUNDING_MIN_TOKENS` | Optional: minimum answer length before the grounding check kicks in (default 4). |
+| `RAG_AUDIT_LOG_RETENTION_DAYS` | Optional: how long audit rows are kept before pruning on insert (default 365). |
+| `RAG_LOGIN_MAX_FAILURES` | Optional: per-username lockout threshold within the rolling window (default 5). |
+| `RAG_LOGIN_MAX_FAILURES_PER_IP` | Optional: per-source-IP throttle threshold within the rolling window (default 20). |
+| `RAG_LOGIN_FAILURE_WINDOW_SECONDS` | Optional: brute-force rolling window length in seconds (default 900 = 15 min). |
 
 Generate a secret key:
 
@@ -173,6 +182,7 @@ docker compose exec api python scripts/manage.py create-tenant --id acme --name 
 docker compose exec api python scripts/manage.py create-admin --tenant acme --username boss
 docker compose exec api python scripts/manage.py create-user --tenant acme --username alice --role user
 docker compose exec api python scripts/manage.py create-api-key --tenant acme --label "prod"
+docker compose exec api python scripts/manage.py revoke-api-key --tenant acme --key <key-hash>
 ```
 
 **Passwords are optional everywhere.** Omit `--password` (or leave the password field
@@ -258,11 +268,26 @@ For a registry-based rollout (recommended at scale):
 
 ## Monitoring & troubleshooting
 
+- **Audit log**: `GET /admin/audit-logs` (auth: admin) — an append-only trail of
+  admin/auth actions (setup, logins and failures, password changes, user/API-key/tenant
+  management, uploads). Enterprise admins see only their own tenant; the platform admin
+  sees everything (including tenant-less events like failed logins). Retention:
+  `RAG_AUDIT_LOG_RETENTION_DAYS` (default 365).
 - **Query log**: `GET /admin/logs?tenant_id=&limit=` (auth: admin) — who asked what, the
   answer, and latency.
-- **Health**: `GET /health` (used by the compose healthcheck).
+- **Health**: `GET /health` (liveness) and `GET /health/ready` (readiness: database
+  reachable + no ingest job in flight — used by the compose healthcheck).
+- **Metrics**: `GET /metrics` exposes Prometheus counters/gauges/histograms
+  (`rag_http_requests_total`, `rag_query_latency_seconds`, `rag_index_documents`,
+  `rag_active_ingest_jobs`, `rag_pipeline_cache_size`, ...) — point a Prometheus/Grafana
+  scrape at it for dashboards and alerting.
+- **Structured logs**: JSON-lines output with a `request_id` per request (echoed back in
+  the `X-Request-ID` response header) so UI/API requests can be correlated across the
+  stack: `docker compose logs -f api | jq -r '.request_id, .msg'`.
 - **Container logs**: `docker compose logs -f api` / `docker compose logs -f ui`.
 - **Statistics**: `GET /stats` per tenant.
+- **Ingest jobs**: `GET /ingest/status` shows whether a re-index is `idle`, `queued`,
+  `running`, `done`, or `failed` for the current tenant.
 
 Common issues:
 
@@ -270,6 +295,8 @@ Common issues:
 |---|---|
 | Sign-in page asks for credentials but you never set them | Setup wasn't run. Complete the one-time wizard at `http://host:8501` (open it fresh), or set `RAG_ADMIN_PASSWORD` in `.env` and re-create the stack. |
 | Query returns "No documents indexed" | Upload documents first (UI sidebar or `POST /documents`). |
+| Upload returns 413 | The file exceeds `RAG_MAX_UPLOAD_MB` (default 50). Raise it in `.env` if the cap is too low. |
+| Every session logs out after a password change | Expected: changing a password revokes all other sessions (tokens signed before the change stop working). |
 | Transformers model downloads at runtime | Pre-download into `models/flan-t5-base/` for offline installs. |
 | Slow answers | Switch to Ollama/vLLM with a 7B model, or use `flan-t5-large`. |
 
@@ -284,6 +311,19 @@ Common issues:
   exceeding `LOGIN_MAX_FAILURES_PER_IP` (default 20) is throttled. A successful login
   clears that account's history; an admin can lift a lockout with
   `scripts/manage.py reset-password --username <user>` (password reset clears failures).
+- Changing a password **revokes every other session instantly** (each login token is bound
+  to the user's token version). Users rotate their own password in the UI sidebar or via
+  `POST /auth/change-password`; the response carries a fresh token for the current session.
+- API keys can be **disabled** (temporarily, `PATCH`) or **revoked** (permanently,
+  `DELETE`) from the admin UI/API/CLI. Rotate credentials by disabling the old key and
+  issuing a new one — the old key stops authenticating immediately.
+- Every admin/auth action lands in the **audit log** (`GET /admin/audit-logs`): setup,
+  successful and failed logins, password changes, user/API-key/tenant management, and
+  document uploads/deletes. It is append-only and pruned only by retention age.
+- Uploads are capped (`RAG_MAX_UPLOAD_MB`, default 50 MiB) — a runaway upload cannot fill
+  the disk, and oversized files are rejected with 413 leaving no partial file.
+- A grounding guardrail validates each LLM answer against the retrieved context before it
+  is shown; unsupported answers are replaced with "I don't know." rather than surfaced.
 - Complete the first-run wizard with a strong admin password; change passwords on demand.
 - Keep the platform admin (`superadmin`) account separate from enterprise admins — its
   credentials unlock every tenant.

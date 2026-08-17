@@ -62,6 +62,11 @@ def get_auth_context(
     user = db.get_user_by_id(payload.get("uid"))
     if user is None or not user["is_active"]:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Account disabled")
+    # A password change bumps token_version, revoking every token signed before
+    # it. Tokens issued before this field existed carry no "tv" (default 0) and
+    # still validate against a user who has never changed their password.
+    if int(payload.get("tv", 0)) != int(user.get("token_version", 0)):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Session revoked")
     tenant = db.get_tenant(user["tenant_id"])
     if tenant is None or not tenant["is_active"]:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Tenant disabled")

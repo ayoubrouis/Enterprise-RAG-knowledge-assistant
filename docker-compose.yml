@@ -26,9 +26,21 @@ services:
       RAG_LLM_BACKEND: ${RAG_LLM_BACKEND:-transformers}
       RAG_LLM_BASE_URL: ${RAG_LLM_BASE_URL:-http://ollama:11434}
       RAG_LLM_MODEL: ${RAG_LLM_MODEL:-google/flan-t5-base}
+      RAG_PIPELINE_CACHE_SIZE: ${RAG_PIPELINE_CACHE_SIZE:-8}
+      RAG_QUERY_RATE_LIMIT_MAX: ${RAG_QUERY_RATE_LIMIT_MAX:-30}
+      RAG_QUERY_RATE_LIMIT_WINDOW_SECONDS: ${RAG_QUERY_RATE_LIMIT_WINDOW_SECONDS:-60}
+      RAG_MAX_UPLOAD_MB: ${RAG_MAX_UPLOAD_MB:-50}
+      RAG_PBKDF2_ITERATIONS: ${RAG_PBKDF2_ITERATIONS:-600000}
+      RAG_GROUNDING_CHECK: ${RAG_GROUNDING_CHECK:-1}
+      RAG_GROUNDING_MIN_OVERLAP: ${RAG_GROUNDING_MIN_OVERLAP:-0.5}
+      RAG_GROUNDING_MIN_TOKENS: ${RAG_GROUNDING_MIN_TOKENS:-4}
+      RAG_AUDIT_LOG_RETENTION_DAYS: ${RAG_AUDIT_LOG_RETENTION_DAYS:-365}
+      RAG_LOGIN_MAX_FAILURES: ${RAG_LOGIN_MAX_FAILURES:-5}
+      RAG_LOGIN_MAX_FAILURES_PER_IP: ${RAG_LOGIN_MAX_FAILURES_PER_IP:-20}
+      RAG_LOGIN_FAILURE_WINDOW_SECONDS: ${RAG_LOGIN_FAILURE_WINDOW_SECONDS:-900}
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5)"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=5)"]
       interval: 30s
       timeout: 10s
       retries: 3

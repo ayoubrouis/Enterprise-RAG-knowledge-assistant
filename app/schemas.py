@@ -21,6 +21,7 @@ class QueryResponse(BaseModel):
     question: str
     answer: str
     sources: list[Source]
+    grounded: bool = True  # False when the grounding guardrail replaced the answer
 
 
 class StatsResponse(BaseModel):
@@ -36,6 +37,17 @@ class IngestResponse(BaseModel):
     saved_to: str
 
 
+class JobStatus(BaseModel):
+    tenant_id: str
+    status: str  # idle | queued | running | done | failed
+    documents: int = 0
+    chunks: int = 0
+    started_at: float | None = None
+    finished_at: float | None = None
+    error: str | None = None
+    saved_to: str | None = None
+
+
 class DocumentInfo(BaseModel):
     filename: str
     size: int
@@ -44,6 +56,24 @@ class DocumentInfo(BaseModel):
 class LoginRequest(BaseModel):
     username: str = Field(min_length=1, max_length=128)
     password: str = Field(min_length=1, max_length=256)
+
+
+class ChangePasswordRequest(BaseModel):
+    old_password: str = Field(min_length=1, max_length=256)
+    new_password: str = Field(min_length=8, max_length=256)
+
+
+class ChangePasswordResponse(BaseModel):
+    token: str
+    token_type: str = "bearer"
+    username: str
+    role: str
+    tenant_id: str
+
+
+class ReadinessResponse(BaseModel):
+    status: str  # ready | degraded
+    checks: dict[str, bool]
 
 
 class SetupStatus(BaseModel):
@@ -120,6 +150,10 @@ class ApiKeyCreate(BaseModel):
     label: str = Field(default="", max_length=128)
 
 
+class ApiKeyUpdate(BaseModel):
+    is_active: bool
+
+
 class ApiKeyOut(BaseModel):
     key_hash: str
     label: str
@@ -132,6 +166,16 @@ class ApiKeyCreated(BaseModel):
     label: str
     key: str
     note: str = "Copy this key now; it is shown only once."
+
+
+class AuditLogOut(BaseModel):
+    id: int
+    created_at: float
+    actor: str
+    actor_role: str | None
+    tenant_id: str | None
+    action: str
+    detail: str | None
 
 
 class QueryLogOut(BaseModel):
