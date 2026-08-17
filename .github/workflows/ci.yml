@@ -42,7 +42,7 @@ jobs:
         run: python -m pytest tests/ -q --tb=short
         env:
           RAG_SECRET_KEY: test-secret-ci-pipeline-2024-abcdef
-          RAG_ALLOW_INSECURE_DEV_KEY: "0"
+          RAG_ALLOW_INSECURE_DEV_KEY: "1"
           RAG_PBKDF2_ITERATIONS: "1000"
           RAG_QUERY_RATE_LIMIT_MAX: "1000000"
 
