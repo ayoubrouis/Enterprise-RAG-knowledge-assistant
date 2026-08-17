@@ -311,6 +311,7 @@ For a registry-based rollout (recommended at scale):
   `rag_active_ingest_jobs`, `rag_pipeline_cache_size`, ...) — point a Prometheus/Grafana
   scrape at it for dashboards and alerting. A ready-to-import Grafana dashboard is at
   `monitoring/grafana-dashboard.json` (import via Grafana UI → Dashboards → Import).
+  Alerting rules are at `monitoring/alert-rules.yml` (load via Prometheus `rule_files`).
 - **Structured logs**: JSON-lines output with a `request_id` per request (echoed back in
   the `X-Request-ID` response header) so UI/API requests can be correlated across the
   stack: `docker compose logs -f api | jq -r '.request_id, .msg'`.
@@ -363,7 +364,9 @@ Common issues:
 - Enterprise admins are hard-scoped: `GET /admin/tenants/{id}/users` and friends return
   `403 Not your tenant` when an admin targets a tenant that isn't theirs.
 - Put the stack behind a reverse proxy with TLS if exposed beyond the LAN (Caddy/Nginx,
-  free). Bind the UI/API to the LAN or VPN, not the public internet.
+  free). Bind the UI/API to the LAN or VPN, not the public internet. A Caddy TLS
+  overlay is included: `docker compose -f docker-compose.yml -f docker-compose.tls.yml up -d`
+  (place certs in `certs/tls.crt` and `certs/tls.key`).
 - The Docker container runs as a **non-root user** with `read_only` filesystem,
   `cap_drop: ALL`, and `no-new-privileges`. Only `/tmp` is writable (tmpfs).
 - **Security headers** are set on every response: `X-Content-Type-Options: nosniff`,

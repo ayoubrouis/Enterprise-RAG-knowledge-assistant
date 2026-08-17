@@ -1424,3 +1424,55 @@ def test_grafana_dashboard_is_valid_json():
     data = json.loads(dash_path.read_text(encoding="utf-8"))
     assert data["uid"] == "enterprise-rag"
     assert len(data["panels"]) >= 8
+
+
+# ---------------------------------------------------------------------------
+# Tier 4: Rate limit response headers
+# ---------------------------------------------------------------------------
+
+
+def test_rate_limit_headers_present_on_normal_response(client, monkeypatch):
+    """Every non-exempt response should carry X-RateLimit-* headers."""
+    resp = client.get("/auth/me")
+    assert "X-RateLimit-Limit" in resp.headers
+    assert "X-RateLimit-Remaining" in resp.headers
+    assert "X-RateLimit-Reset" in resp.headers
+    assert int(resp.headers["X-RateLimit-Remaining"]) >= 0
+
+
+def test_rate_limit_headers_on_429(anon_client, monkeypatch):
+    """429 responses should carry X-RateLimit-Remaining=0."""
+    import app.main as main_mod
+
+    tiny = main_mod._SlidingWindowRateLimiter(max_requests=2, window_seconds=60)
+    monkeypatch.setattr(main_mod, "_global_rate_limiter", tiny)
+    for _ in range(2):
+        anon_client.get("/auth/me")
+    resp = anon_client.get("/auth/me")
+    assert resp.status_code == 429
+    assert resp.headers["X-RateLimit-Remaining"] == "0"
+    assert "Retry-After" in resp.headers
+
+
+# ---------------------------------------------------------------------------
+# Tier 4: Alerting rules valid YAML
+# ---------------------------------------------------------------------------
+
+
+def test_alert_rules_is_valid_yaml():
+    import json
+    from pathlib import Path
+
+    rules_path = Path(__file__).resolve().parent.parent / "monitoring" / "alert-rules.yml"
+    assert rules_path.exists(), "alert-rules.yml not found"
+    try:
+        import yaml
+        data = yaml.safe_load(rules_path.read_text(encoding="utf-8"))
+    except ImportError:
+        # No PyYAML — do a basic syntax check with json fallback
+        content = rules_path.read_text(encoding="utf-8")
+        assert "groups:" in content
+        assert "rag_alerts" in content
+        return
+    assert len(data["groups"]) == 1
+    assert len(data["groups"][0]["rules"]) >= 4

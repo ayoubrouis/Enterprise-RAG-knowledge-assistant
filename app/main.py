@@ -124,15 +124,26 @@ async def _global_rate_limit(request: Request, call_next):
     if request.url.path in ("/health", "/health/ready", "/metrics"):
         return await call_next(request)
     ip = request.client.host if request.client else "unknown"
-    if _global_rate_limiter.allow(ip):
-        return await call_next(request)
-    retry = int(_global_rate_limiter.retry_after(ip)) + 1
-    return Response(
-        content='{"detail":"Rate limit exceeded. Try again later."}',
-        status_code=429,
-        media_type="application/json",
-        headers={"Retry-After": str(retry), "X-Request-ID": request_id_var.get("")},
-    )
+    if not _global_rate_limiter.allow(ip):
+        retry = int(_global_rate_limiter.retry_after(ip)) + 1
+        return Response(
+            content='{"detail":"Rate limit exceeded. Try again later."}',
+            status_code=429,
+            media_type="application/json",
+            headers={
+                "Retry-After": str(retry),
+                "X-RateLimit-Limit": str(_global_rate_limiter.max_requests),
+                "X-RateLimit-Remaining": "0",
+                "X-RateLimit-Reset": str(_global_rate_limiter.reset_after(ip)),
+                "X-Request-ID": request_id_var.get(""),
+            },
+        )
+    response = await call_next(request)
+    remaining = _global_rate_limiter.remaining(ip)
+    response.headers["X-RateLimit-Limit"] = str(_global_rate_limiter.max_requests)
+    response.headers["X-RateLimit-Remaining"] = str(remaining)
+    response.headers["X-RateLimit-Reset"] = str(_global_rate_limiter.reset_after(ip))
+    return response
 
 
 # ---------------------------------------------------------------------------
@@ -315,6 +326,22 @@ class _SlidingWindowRateLimiter:
             if not q:
                 return 0.0
             return max(0.0, q[0] + self.window - now)
+
+    def remaining(self, key: str) -> int:
+        """How many more requests the caller can make right now."""
+        now = time.monotonic()
+        cutoff = now - self.window
+        with self._guard:
+            q = self._hits.get(key)
+            if not q:
+                return self.max_requests
+            active = sum(1 for t in q if t > cutoff)
+            return max(0, self.max_requests - active)
+
+    def reset_after(self, key: str) -> int:
+        """Seconds until the oldest hit in the window expires (rate limit resets)."""
+        retry = self.retry_after(key)
+        return int(retry) + (1 if retry > int(retry) else 0)
 
     def clear(self, key: str) -> None:
         with self._guard:

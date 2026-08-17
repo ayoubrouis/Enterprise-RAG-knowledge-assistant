@@ -1,0 +1,59 @@
+# Enterprise RAG Knowledge Assistant - Prometheus alerting rules.
+# Load this via Prometheus rule_files or alertmanager config.
+# See: https://prometheus.io/docs/prometheus/latest/configuration/alerting_rules/
+
+groups:
+  - name: rag_alerts
+    rules:
+      # High error rate (>5% of requests are 5xx for 5 minutes)
+      - alert: RAGHighErrorRate
+        expr: |
+          sum(rate(rag_http_requests_total{status=~"5.."}[5m]))
+          / sum(rate(rag_http_requests_total[5m])) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "High 5xx error rate on RAG API"
+          description: "{{ $value | humanizePercentage }} of requests are returning 5xx errors."
+
+      # Query latency p95 > 30 seconds
+      - alert: RAGSlowQueries
+        expr: |
+          histogram_quantile(0.95, sum(rate(rag_query_latency_seconds_bucket[5m])) by (le)) > 30
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "RAG query latency p95 exceeds 30s"
+          description: "p95 query latency is {{ $value | humanizeDuration }}."
+
+      # Ingest jobs stuck (active > 0 for more than 30 minutes)
+      - alert: RAGIngestStuck
+        expr: rag_active_ingest_jobs > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "RAG ingest job has been running for >30 minutes"
+          description: "{{ $value }} ingest job(s) still active."
+
+      # Pipeline cache full (all slots occupied)
+      - alert: RAGPipelineCacheFull
+        expr: rag_pipeline_cache_size >= 8
+        for: 10m
+        labels:
+          severity: info
+        annotations:
+          summary: "RAG pipeline cache is full"
+          description: "{{ $value }} pipelines cached; consider raising RAG_PIPELINE_CACHE_SIZE."
+
+      # No HTTP traffic for 15 minutes (service may be down)
+      - alert: RAGNoTraffic
+        expr: sum(rate(rag_http_requests_total[5m])) == 0
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No HTTP traffic to RAG API for 15 minutes"
+          description: "The RAG API may be down or unreachable."

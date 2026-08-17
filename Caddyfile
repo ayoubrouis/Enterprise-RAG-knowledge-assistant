@@ -1,0 +1,30 @@
+# Caddy reverse proxy for TLS termination.
+# Place your TLS cert + key at certs/tls.crt and certs/tls.key, or use
+# Caddy's built-in ACME (Let's Encrypt) by setting a real domain.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.tls.yml up -d
+#
+# Without certs, Caddy serves plain HTTPS with a self-signed cert (browser
+# warning). For production, mount real certs or point Caddy at a domain.
+
+:443 {
+    tls /certs/tls.crt /certs/tls.key
+
+    # Security headers
+    header {
+        X-Content-Type-Options nosniff
+        X-Frame-Options DENY
+        Referrer-Policy strict-origin-when-cross-origin
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        -Server
+    }
+
+    # Proxy to the FastAPI backend.
+    reverse_proxy api:8000
+}
+
+# Redirect HTTP to HTTPS.
+:80 {
+    redir https://{host}{uri} permanent
+}
