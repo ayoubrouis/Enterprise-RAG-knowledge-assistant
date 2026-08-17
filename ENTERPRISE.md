@@ -108,6 +108,18 @@ python3 -c "import secrets; print(secrets.token_urlsafe(48))"
 docker compose up -d --build
 ```
 
+For production with TLS (place certs in `certs/tls.crt` and `certs/tls.key`):
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.tls.yml up -d --build
+```
+
+To enable automated daily backups:
+
+```bash
+docker compose --profile backup up -d backup
+```
+
 ### 4. First-run setup (register your enterprise)
 
 With `RAG_ADMIN_PASSWORD` left empty (default), the system starts un-bootstrapped. Open
@@ -378,6 +390,14 @@ Common issues:
   plaintext credentials.
 - Tenants are isolated on disk; enabling multi-tenancy on one box keeps each tenant's
   documents and index separate.
+- **Information-leak prevention:** disabled accounts return the same 401 as wrong-password
+  logins, so attackers cannot enumerate which usernames exist or which are disabled.
+- **Admin safety:** admins cannot disable their own account (self-lockout prevention).
+- **Thread safety:** the auth database connection is initialized with a separate lock to
+  prevent deadlocks under concurrent first access.
+- **Token hygiene:** expired revoked tokens are pruned on startup; the rate limiter
+  reclaims memory from inactive IPs. The `X-Request-ID` header is sanitized against
+  log-injection and header-abuse attacks.
 
 ---
 

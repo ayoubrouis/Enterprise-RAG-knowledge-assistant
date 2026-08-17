@@ -6,7 +6,7 @@ index, and answers natural-language questions with **source-cited responses**.
 
 No paid APIs. No subscriptions. No cloud services. Everything runs on your hardware with
 free, open-source models. Designed to be sold/installed **on-prem per enterprise** (see
-[ENTERPRISE.md](ENTERPRISE.md)).
+[ENTERPRISE.md](ENTERPRISE.md)). See [CHANGELOG.md](CHANGELOG.md) for the full version history.
 
 ---
 
@@ -42,8 +42,9 @@ free, open-source models. Designed to be sold/installed **on-prem per enterprise
   UI/API requests, Prometheus metrics at `/metrics`, and a `/health/ready` readiness probe
   used by the Docker healthcheck.
 - **Security hardening** — configurable CORS, security headers (HSTS, nosniff, DENY frame),
-  non-root Docker container with read-only filesystem, global per-IP rate limiting, and
-  per-caller rate limiting on the expensive `/query` endpoint.
+  non-root Docker container with read-only filesystem, global per-IP rate limiting (with
+  `X-RateLimit-*` headers on every response), and per-caller rate limiting on the expensive
+  `/query` endpoint.
 - **Three LLM backends** — in-process transformers (default, any CPU), Ollama (CPU/GPU),
   or vLLM (NVIDIA GPU). Swap via one environment variable.
 - **REST API** — FastAPI with interactive Swagger docs at `/docs`.
@@ -91,7 +92,8 @@ free, open-source models. Designed to be sold/installed **on-prem per enterprise
 │   └── download_model.py    # resumable model downloader
 ├── tests/                   # no-network unit + API tests
 ├── monitoring/
-│   └── grafana-dashboard.json  # ready-to-import Grafana dashboard
+│   ├── grafana-dashboard.json  # ready-to-import Grafana dashboard
+│   └── alert-rules.yml         # Prometheus alerting rules (5 alerts)
 ├── data/
 │   ├── tenants/<id>/docs/   # each tenant's source documents
 │   ├── tenants/<id>/vectorstore/  # each tenant's FAISS index
@@ -357,7 +359,8 @@ this just means the retriever adds filler context, which is normal in RAG.
 Tests need no network and no model downloads (the API tests inject a fake pipeline and
 use a throwaway SQLite file). The suite covers auth, tenant/admin scoping, token
 revocation on password change, API-key disable/revoke, the audit log, grounding checks,
-upload caps, background ingest jobs, and metrics/readiness.
+upload caps, background ingest jobs, metrics/readiness, brute-force protection, CORS,
+Docker hardening, TLS overlay, backup/restore, and regression tests for audit fixes.
 
 ---
 

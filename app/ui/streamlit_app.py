@@ -191,6 +191,8 @@ with st.sidebar:
                 resp = _request("delete", f"/documents/{quote(doc['filename'])}")
                 if resp.status_code in (200, 202):
                     _wait_for_ingest()
+                else:
+                    st.error(f"Delete failed: {resp.text}")
                 st.rerun()
 
     st.divider()
@@ -221,6 +223,8 @@ with st.sidebar:
     st.caption(f"LLM backend: `{settings.LLM_BACKEND}` · model `{settings.LLM_MODEL}`")
 
     if st.button("Sign out"):
+        # Revoke the token server-side before clearing the local session.
+        _request("post", "/auth/logout")
         st.session_state.clear()
         st.rerun()
 
@@ -249,7 +253,12 @@ def _tenant_management(tenant_id: str, can_disable: bool, t: dict) -> None:
     role_choices = ["user", "admin", "superadmin"] if user["role"] == "superadmin" else ["user", "admin"]
 
     st.write("**Users**")
-    users = _request("get", f"/admin/tenants/{tenant_id}/users").json()
+    users_resp = _request("get", f"/admin/tenants/{tenant_id}/users")
+    if users_resp.status_code != 200:
+        st.error(f"Failed to load users: {users_resp.text}")
+        users = []
+    else:
+        users = users_resp.json()
     for u in users:
         uc1, uc2, uc3 = st.columns([4, 2, 2])
         uc1.caption(f"{u['username']} ({u['role']})")
@@ -287,7 +296,12 @@ def _tenant_management(tenant_id: str, can_disable: bool, t: dict) -> None:
                     st.error(r.text)
 
     st.write("**API keys**")
-    keys = _request("get", f"/admin/tenants/{tenant_id}/api-keys").json()
+    keys_resp = _request("get", f"/admin/tenants/{tenant_id}/api-keys")
+    if keys_resp.status_code != 200:
+        st.error(f"Failed to load API keys: {keys_resp.text}")
+        keys = []
+    else:
+        keys = keys_resp.json()
     for k in keys:
         col1, col2, col3 = st.columns([4, 2, 1])
         col1.caption(f"{k['label'] or '(no label)'} · `{k['key_hash'][:12]}…` · {'active' if k['is_active'] else 'disabled'}")

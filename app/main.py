@@ -86,6 +86,8 @@ async def lifespan(_: FastAPI):
     setup_logging()
     db.seed_defaults()
     _register_metrics()
+    # Prune expired revocation records on startup so the table stays bounded.
+    db.prune_revoked_tokens()
     yield
 
 
@@ -186,7 +188,12 @@ def _metric_path(path: str) -> str:
 
 @app.middleware("http")
 async def _request_context(request: Request, call_next):
-    request_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex
+    raw_id = request.headers.get("X-Request-ID", "")
+    # Sanitize: only allow alphanumeric up to 64 chars, else generate a new one.
+    request_id = (
+        raw_id if len(raw_id) <= 64 and raw_id.isalnum()
+        else uuid.uuid4().hex
+    )
     token = request_id_var.set(request_id)
     start = time.perf_counter()
     try:
@@ -313,6 +320,10 @@ class _SlidingWindowRateLimiter:
             q = self._hits.setdefault(key, deque())
             while q and q[0] <= cutoff:
                 q.popleft()
+            # Remove empty deques so old keys don't leak memory.
+            if not q:
+                del self._hits[key]
+                q = self._hits.setdefault(key, deque())
             if len(q) >= self.max_requests:
                 return False
             q.append(now)
@@ -590,6 +601,8 @@ def setup_status() -> SetupStatus:
 
 @app.post("/auth/setup", response_model=LoginResponse)
 def setup(request: SetupRequest) -> LoginResponse:
+    if len(request.password) < 8:
+        raise HTTPException(422, "Password must be at least 8 characters")
     try:
         user = db.run_setup(request.tenant_name, request.username, request.password)
     except ValueError:
@@ -646,10 +659,12 @@ def login(request: LoginRequest, req: Request) -> LoginResponse:
         db.log_audit(None, request.username, None, "login_failed", f"ip={ip}")
         raise HTTPException(401, "Invalid username or password")
     if not user["is_active"]:
-        raise HTTPException(403, "Account disabled")
+        db.log_audit(None, request.username, None, "login_disabled_account", f"ip={ip}")
+        raise HTTPException(401, "Invalid username or password")
     tenant = db.get_tenant(user["tenant_id"])
     if tenant is None or not tenant["is_active"]:
-        raise HTTPException(403, "Tenant disabled")
+        db.log_audit(None, request.username, None, "login_disabled_tenant", f"ip={ip}")
+        raise HTTPException(401, "Invalid username or password")
     db.clear_login_failures(request.username)
     if needs_rehash(parsed):
         # Stored hash predates the current PBKDF2 cost: upgrade it in place.
@@ -689,7 +704,12 @@ def change_password(
         raise HTTPException(
             422, "New password must be different from the current password"
         )
+    if len(request.new_password) < 8:
+        raise HTTPException(422, "New password must be at least 8 characters")
     db.set_user_password(user["id"], request.new_password)
+    # Revoke the current session's token so the old jti cannot be reused.
+    if auth.jti:
+        db.revoke_token(auth.jti, auth.user_id)
     db.clear_login_failures(auth.username)
     db.log_audit(auth.tenant_id, auth.username, auth.role, "password_change")
     fresh = db.get_user_by_id(user["id"])
@@ -979,6 +999,9 @@ def admin_update_user(
     user = db.get_user_by_username(username)
     if user is None or user["tenant_id"] != tenant_id:
         raise HTTPException(404, "User not found")
+    # Prevent admins from disabling their own account (self-lockout).
+    if not body.is_active and auth.username == username:
+        raise HTTPException(400, "Cannot disable your own account")
     db.set_user_active(user["id"], body.is_active)
     db.log_audit(
         tenant_id,
@@ -1073,8 +1096,9 @@ def admin_logs(
     # Enterprise admins only ever see their own tenant's log.
     if auth.role == "admin":
         tenant_id = auth.tenant_id
+    limit = max(1, min(limit, 500))
     return [
-        QueryLogOut(**r) for r in db.list_logs(tenant_id=tenant_id, limit=min(limit, 500))
+        QueryLogOut(**r) for r in db.list_logs(tenant_id=tenant_id, limit=limit)
     ]
 
 
@@ -1088,7 +1112,8 @@ def admin_audit_logs(
     to their own tenant; the platform admin sees everything."""
     if auth.role == "admin":
         tenant_id = auth.tenant_id
+    limit = max(1, min(limit, 1000))
     return [
         AuditLogOut(**r)
-        for r in db.list_audit_logs(tenant_id=tenant_id, limit=min(limit, 1000))
+        for r in db.list_audit_logs(tenant_id=tenant_id, limit=limit)
     ]

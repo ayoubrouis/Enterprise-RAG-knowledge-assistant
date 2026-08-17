@@ -20,6 +20,7 @@ from app.config import settings
 from app.security import hash_password, new_api_key
 
 _DB_LOCK = threading.Lock()
+_INIT_LOCK = threading.Lock()
 _CONN: sqlite3.Connection | None = None
 
 
@@ -35,8 +36,10 @@ def _connect() -> sqlite3.Connection:
 def get_conn() -> sqlite3.Connection:
     global _CONN
     if _CONN is None:
-        _CONN = _connect()
-        _init_schema()
+        with _INIT_LOCK:
+            if _CONN is None:
+                _CONN = _connect()
+                _init_schema()
     return _CONN
 
 
@@ -306,6 +309,8 @@ def count_documents(tenant_id: str) -> int:
 # ---------------------------------------------------------------------------
 
 def create_user(tenant_id: str, username: str, password: str, role: str = "user") -> dict:
+    if get_tenant(tenant_id) is None:
+        raise ValueError(f"Tenant '{tenant_id}' does not exist")
     with tx() as conn:
         try:
             cur = conn.execute(

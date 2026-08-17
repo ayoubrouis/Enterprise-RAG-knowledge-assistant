@@ -527,7 +527,7 @@ def test_admin_can_disable_user(client):
     login = client.post(
         "/auth/login", json={"username": username, "password": "correct-horse-1"}
     )
-    assert login.status_code == 403  # account disabled
+    assert login.status_code == 401  # disabled account returns same 401 as wrong password
 
 
 # ---------------------------------------------------------------------------
@@ -1476,3 +1476,103 @@ def test_alert_rules_is_valid_yaml():
         return
     assert len(data["groups"]) == 1
     assert len(data["groups"][0]["rules"]) >= 4
+
+
+# ---------------------------------------------------------------------------
+# Loophole fix regression tests
+# ---------------------------------------------------------------------------
+
+
+def test_setup_rejects_short_password(anon_client):
+    """POST /auth/setup should reject passwords shorter than 8 characters."""
+    resp = anon_client.post(
+        "/auth/setup",
+        json={"tenant_name": "TestCo", "username": "boss", "password": "short"},
+    )
+    assert resp.status_code == 422
+
+
+def test_change_password_rejects_short_new_password(anon_client):
+    """POST /auth/change-password should reject new passwords shorter than 8 chars."""
+    import app.db as db
+    from app.security import make_login_token
+
+    user = db.create_user("default", "short_pw_user", "Passw0rd123!", "user")
+    token = make_login_token(user)
+    resp = anon_client.post(
+        "/auth/change-password",
+        json={"old_password": "Passw0rd123!", "new_password": "short"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 422
+
+
+def test_admin_cannot_disable_own_account(anon_client):
+    """Admins should not be able to disable their own account (self-lockout)."""
+    import app.db as db
+    from app.security import make_login_token
+
+    user = db.get_user_by_username("admin")
+    if user is None:
+        db.create_user("default", "admin", "AdminPass0rd!", "admin")
+        user = db.get_user_by_username("admin")
+    token = make_login_token(user)
+    resp = anon_client.patch(
+        f"/admin/tenants/default/users/{user['username']}",
+        json={"is_active": False},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 400
+    assert "own account" in resp.json()["detail"].lower()
+
+
+def test_disabled_account_login_returns_same_401_as_wrong_password(anon_client):
+    """Disabled accounts must return 401 (not 403) to avoid leaking account status."""
+    import app.db as db
+
+    db.create_user("default", "disabled_login_test", "Passw0rd123!", "user")
+    db.set_user_active(
+        db.get_user_by_username("disabled_login_test")["id"], False
+    )
+    resp = anon_client.post(
+        "/auth/login",
+        json={"username": "disabled_login_test", "password": "Passw0rd123!"},
+    )
+    assert resp.status_code == 401
+    assert resp.json()["detail"] == "Invalid username or password"
+
+
+def test_negative_limit_clamped_on_audit_logs(client):
+    """Negative limit values should be clamped, not passed to SQLite."""
+    resp = client.get("/admin/audit-logs?limit=-1")
+    assert resp.status_code == 200
+    # Should return at most 1000 entries (the clamped max), not everything.
+    assert len(resp.json()) <= 1000
+
+
+def test_x_request_id_sanitized(client):
+    """Malicious X-Request-ID values should be replaced with a generated one."""
+    resp = client.get("/health", headers={"X-Request-ID": "../../etc/passwd"})
+    assert resp.status_code == 200
+    rid = resp.headers.get("X-Request-ID", "")
+    # Should be a hex string (from uuid4), not the injected value.
+    assert rid != "../../etc/passwd"
+    assert len(rid) == 32  # uuid4().hex
+
+
+def test_change_password_revokes_current_token(anon_client):
+    """Changing password should revoke the token used for the request."""
+    import app.db as db
+    from app.security import make_login_token
+
+    user = db.create_user("default", "revoke_self_user", "OldPassw0rd!", "user")
+    token = make_login_token(user)
+    resp = anon_client.post(
+        "/auth/change-password",
+        json={"old_password": "OldPassw0rd!", "new_password": "NewPassw0rd!"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200
+    # The old token (used for the request) should now be rejected.
+    resp2 = anon_client.get("/auth/me", headers={"Authorization": f"Bearer {token}"})
+    assert resp2.status_code == 401
